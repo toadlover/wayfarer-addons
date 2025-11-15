@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Wayfarer Review History Table
-// @version      0.4.1
+// @version      0.4.2
 // @description  Add local review history storage to Wayfarer
 // @namespace    https://github.com/tehstone/wayfarer-addons
 // @homepageURL  https://github.com/tehstone/wayfarer-addons
@@ -109,6 +109,26 @@
         .join("")}</span>`;
     }
 
+    const formatContent = obj => {
+        if (obj === null) {
+            return null;
+        } else if (Array.isArray(obj)) {
+            return obj.map(e => formatContent(e));
+        } else if (typeof obj === "object") {
+            const e = {};
+            for (const [k, v] of Object.entries(obj)) {
+                e[k] = formatContent(v);
+            }
+            return e;
+        } else if (typeof obj === "string") {
+            const e = document.createElement("p");
+            e.textContent = obj;
+            return e.innerHTML;
+        } else {
+            return obj.toString();
+        }
+    }
+
     const renderReviewHistory = result => new Promise((resolve, reject) => {
         getIDBInstance().then(db => {
             const toSave = [];
@@ -130,9 +150,9 @@
                     }
                 }
                 renderTableSelector();
-                renderTable(toSave);
-                renderEditsTable(editsToSave);
-                renderPhotosTable(photosToSave);
+                renderTable(formatContent(toSave));
+                renderEditsTable(formatContent(editsToSave));
+                renderPhotosTable(formatContent(photosToSave));
             };
         }).catch(reject);
     });
