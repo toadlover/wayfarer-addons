@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.4
+// @version     0.0.5
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
@@ -63,7 +63,7 @@ function init() {
       selectedStatuses: new Set(["ACCEPTED"]),
       selectedTypes: new Set(["NOMINATION"]),
       aggregationMode: "cityState", // or "state"
-      maxBars: 20
+      maxBars: 20 // default number of bars to display in plot
     };
 
     /**
@@ -764,6 +764,20 @@ function init() {
         align-items: flex-start;
       `;
 
+      // Max bars selector
+      const maxBarsBlock = document.createElement("div");
+      maxBarsBlock.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 6px;">Max bars</div>
+        <select id="wfns-max-bars" style="padding: 4px 6px; border-radius: 4px;">
+          <option value="20" ${plotState.maxBars === 20 ? "selected" : ""}>20</option>
+          <option value="50" ${plotState.maxBars === 50 ? "selected" : ""}>50</option>
+          <option value="100" ${plotState.maxBars === 100 ? "selected" : ""}>100</option>
+          <option value="200" ${plotState.maxBars === 200 ? "selected" : ""}>200</option>
+          <option value="all" ${plotState.maxBars === "all" ? "selected" : ""}>All</option>
+        </select>
+      `;
+      wrapper.appendChild(maxBarsBlock);
+
       // Aggregation selector
       const aggBlock = document.createElement("div");
       aggBlock.innerHTML = `
@@ -841,6 +855,15 @@ function init() {
           renderPlots();
         });
       });
+
+      const maxBarsSelect = controls.querySelector("#wfns-max-bars");
+      if (maxBarsSelect) {
+        maxBarsSelect.addEventListener("change", (e) => {
+          plotState.maxBars = e.target.value === "all" ? "all" : Number(e.target.value);
+          renderPlots();
+        });
+      }
+
     }
 
     function getAreaLabel(nomination, aggregationMode) {
@@ -891,13 +914,18 @@ function init() {
 
 
     function getTopAreas(stackedData, maxBars = 20) {
-      return Object.entries(stackedData)
+      const rows = Object.entries(stackedData)
         .map(([area, counts]) => {
           const total = Object.values(counts).reduce((sum, val) => sum + val, 0);
           return { area, counts, total };
         })
-        .sort((a, b) => b.total - a.total)
-        .slice(0, maxBars);
+        .sort((a, b) => b.total - a.total);
+
+      if (maxBars === "all") {
+        return rows;
+      }
+
+      return rows.slice(0, maxBars);
     }
 
     const STATUS_COLORS = {
