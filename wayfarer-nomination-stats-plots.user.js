@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.5
+// @version     0.0.6
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
@@ -963,7 +963,7 @@ function init() {
 
       const title = document.createElement("div");
       title.textContent = "Nominations by Area";
-      title.style.cssText = "font-weight: 700; margin-bottom: 12px;";
+      title.style.cssText = "font-weight: 700; margin-bottom: 12px; color: #000;";
       outer.appendChild(title);
 
       const barsWrap = document.createElement("div");
@@ -983,8 +983,8 @@ function init() {
           display: flex;
           flex-direction: column;
           align-items: center;
-          min-width: 56px;
-          flex: 0 0 auto;
+          width: 72px;
+          flex: 0 0 72px;
         `;
 
         const totalLabel = document.createElement("div");
@@ -992,7 +992,7 @@ function init() {
         totalLabel.style.cssText = `
           font-size: 12px;
           margin-bottom: 6px;
-          color: #333;
+          color: #000;
         `;
 
         const barOuter = document.createElement("div");
@@ -1039,9 +1039,17 @@ function init() {
           margin-top: 8px;
           font-size: 11px;
           text-align: center;
-          max-width: 72px;
-          word-break: break-word;
+          width: 72px;
+          min-height: 60px;
+          max-height: 60px;
           line-height: 1.2;
+          overflow: hidden;
+          display: flex;
+          align-items: flex-start;
+          justify-content: center;
+          word-break: break-word;
+          overflow-wrap: anywhere;
+          color: #000;
         `;
 
         col.appendChild(totalLabel);
@@ -1067,6 +1075,7 @@ function init() {
           align-items: center;
           gap: 6px;
           font-size: 12px;
+          color: #000;
         `;
         item.innerHTML = `
           <span style="display:inline-block;width:12px;height:12px;background:${STATUS_COLORS[status] || "#888"};border-radius:2px;"></span>
