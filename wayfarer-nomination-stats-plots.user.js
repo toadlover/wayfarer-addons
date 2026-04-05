@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.3
+// @version     0.0.4
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
@@ -33,6 +33,38 @@
 
 function init() {
     let nominations;
+
+    // Contstants and states
+    const PLOT_STATUS_TYPES = [
+      "ACCEPTED",
+      "REJECTED",
+      "DUPLICATE",
+      "VOTING",
+      "NOMINATED",
+      "NIANTIC_REVIEW",
+      "APPEALED",
+      "WITHDRAWN",
+      "HELD"
+    ];
+
+    const PLOT_TYPE_OPTIONS = [
+      "NOMINATION",
+      "EDIT",
+      "PHOTO"
+    ];
+
+    const EDIT_SUBTYPES = [
+      "EDIT_TITLE",
+      "EDIT_DESCRIPTION",
+      "EDIT_LOCATION"
+    ];
+
+    const plotState = {
+      selectedStatuses: new Set(["ACCEPTED"]),
+      selectedTypes: new Set(["NOMINATION"]),
+      aggregationMode: "cityState", // or "state"
+      maxBars: 20
+    };
 
     /**
      * Overwrite the open method of the XMLHttpRequest.prototype to intercept the server calls
@@ -84,14 +116,16 @@ function init() {
             addCss();
 
             //start addition of basic bar plot
-            const areaCounts = getAcceptedNominationsByArea(nominations);
+            //const areaCounts = getAcceptedNominationsByArea(nominations);
 
-            const chart = renderBarChart(areaCounts, "Accepted Nominations (NOMINATION only) by Area");
+            //const chart = renderBarChart(areaCounts, "Accepted Nominations (NOMINATION only) by Area");
 
-            const list = document.querySelector('app-submissions-list');
-            if (list && list.parentNode) {
-              list.parentNode.insertBefore(chart, list);
-            }
+            //const list = document.querySelector('app-submissions-list');
+            //if (list && list.parentNode) {
+            //  list.parentNode.insertBefore(chart, list);
+            //}
+
+            //addPlotsSection();
             //end addition of basic bar plot
 
             const countsByTypeAndStatus = {
@@ -212,6 +246,9 @@ function init() {
 
             const container = ref.parentNode;
             container.appendChild(statsContainer);
+
+            // Make plot here after data is derived
+            addPlotsSection();
 
             // Check upgrade notification
             const userId = getUserId();
@@ -669,6 +706,355 @@ function init() {
       });
 
       return container;
+    }
+
+    // Functionality to add plots section
+    function addPlotsSection() {
+      if (document.getElementById("wfns-plots-root")) return;
+
+      const statsContainer =
+        document.querySelector("#nomStats") ||
+        document.querySelector(".wayfarerns__visible") ||
+        document.querySelector("app-submissions-list");
+
+      if (!statsContainer) return;
+
+      const root = document.createElement("div");
+      root.id = "wfns-plots-root";
+      root.className = "wayfarerns";
+      root.style.marginTop = "16px";
+
+      root.innerHTML = `
+        <div class="wrap-collabsible">
+          <input id="collapsed-plots" class="toggle" type="checkbox" checked>
+          <label for="collapsed-plots" class="lbl-toggle-ns">View Nomination Plots</label>
+          <div class="collapsible-content-ns">
+            <div class="content-inner" id="wfns-plots-inner">
+              <div id="wfns-plot-controls"></div>
+              <div id="wfns-plot-chart"></div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      // Prefer placing directly after the stats panel if it exists
+      const nomStats = document.getElementById("nomStats");
+      if (nomStats && nomStats.parentNode) {
+        nomStats.parentNode.insertBefore(root, nomStats.nextSibling);
+      } else if (statsContainer.parentNode) {
+        statsContainer.parentNode.insertBefore(root, statsContainer.nextSibling);
+      }
+
+      renderPlotControls();
+      renderPlots();
+    }
+
+    function renderPlotControls() {
+      const controls = document.getElementById("wfns-plot-controls");
+      if (!controls) return;
+
+      controls.innerHTML = "";
+
+      const wrapper = document.createElement("div");
+      wrapper.style.cssText = `
+        display: flex;
+        flex-wrap: wrap;
+        gap: 20px;
+        margin-bottom: 16px;
+        align-items: flex-start;
+      `;
+
+      // Aggregation selector
+      const aggBlock = document.createElement("div");
+      aggBlock.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 6px;">Aggregate by</div>
+        <label style="display:block; margin-bottom:4px;">
+          <input type="radio" name="wfns-agg" value="cityState" ${plotState.aggregationMode === "cityState" ? "checked" : ""}>
+          City + State
+        </label>
+        <label style="display:block;">
+          <input type="radio" name="wfns-agg" value="state" ${plotState.aggregationMode === "state" ? "checked" : ""}>
+          State
+        </label>
+      `;
+      wrapper.appendChild(aggBlock);
+
+      // Type selector
+      const typeBlock = document.createElement("div");
+      typeBlock.innerHTML = `<div style="font-weight: 600; margin-bottom: 6px;">Types</div>`;
+      PLOT_TYPE_OPTIONS.forEach(type => {
+        const label = document.createElement("label");
+        label.style.display = "block";
+        label.style.marginBottom = "4px";
+        label.innerHTML = `
+          <input type="checkbox" data-type="${type}" ${plotState.selectedTypes.has(type) ? "checked" : ""}>
+          ${type}
+        `;
+        typeBlock.appendChild(label);
+      });
+      wrapper.appendChild(typeBlock);
+
+      // Status selector
+      const statusBlock = document.createElement("div");
+      statusBlock.innerHTML = `<div style="font-weight: 600; margin-bottom: 6px;">Statuses</div>`;
+      PLOT_STATUS_TYPES.forEach(status => {
+        const label = document.createElement("label");
+        label.style.display = "block";
+        label.style.marginBottom = "4px";
+        label.innerHTML = `
+          <input type="checkbox" data-status="${status}" ${plotState.selectedStatuses.has(status) ? "checked" : ""}>
+          ${status}
+        `;
+        statusBlock.appendChild(label);
+      });
+      wrapper.appendChild(statusBlock);
+
+      controls.appendChild(wrapper);
+
+      controls.querySelectorAll('input[name="wfns-agg"]').forEach(input => {
+        input.addEventListener("change", (e) => {
+          plotState.aggregationMode = e.target.value;
+          renderPlots();
+        });
+      });
+
+      controls.querySelectorAll("input[data-type]").forEach(input => {
+        input.addEventListener("change", (e) => {
+          const type = e.target.dataset.type;
+          if (e.target.checked) {
+            plotState.selectedTypes.add(type);
+          } else {
+            plotState.selectedTypes.delete(type);
+          }
+          renderPlots();
+        });
+      });
+
+      controls.querySelectorAll("input[data-status]").forEach(input => {
+        input.addEventListener("change", (e) => {
+          const status = e.target.dataset.status;
+          if (e.target.checked) {
+            plotState.selectedStatuses.add(status);
+          } else {
+            plotState.selectedStatuses.delete(status);
+          }
+          renderPlots();
+        });
+      });
+    }
+
+    function getAreaLabel(nomination, aggregationMode) {
+      const city = nomination.city || "Unknown City";
+      const state = nomination.state || "Unknown State";
+
+      if (aggregationMode === "state") {
+        return state;
+      }
+      return `${city}, ${state}`;
+    }
+
+    function nominationMatchesSelectedType(nomination, selectedType) {
+      if (selectedType === "EDIT") {
+        return EDIT_SUBTYPES.includes(nomination.type);
+      }
+      return nomination.type === selectedType;
+    }
+
+    function buildStackedAreaData(nominations) {
+      const result = {};
+
+      nominations.forEach(nomination => {
+        if (!nomination) return;
+        if (!plotState.selectedStatuses.has(nomination.status)) return;
+
+        const typeMatch = Array.from(plotState.selectedTypes).some(type =>
+          nominationMatchesSelectedType(nomination, type)
+        );
+
+        if (!typeMatch) return;
+
+        const area = getAreaLabel(nomination, plotState.aggregationMode);
+
+        if (!result[area]) {
+          result[area] = {};
+        }
+
+        if (!result[area][nomination.status]) {
+          result[area][nomination.status] = 0;
+        }
+
+        result[area][nomination.status] += 1;
+      });
+
+      return result;
+    }
+
+
+    function getTopAreas(stackedData, maxBars = 20) {
+      return Object.entries(stackedData)
+        .map(([area, counts]) => {
+          const total = Object.values(counts).reduce((sum, val) => sum + val, 0);
+          return { area, counts, total };
+        })
+        .sort((a, b) => b.total - a.total)
+        .slice(0, maxBars);
+    }
+
+    const STATUS_COLORS = {
+      ACCEPTED: "#4caf50",
+      REJECTED: "#f44336",
+      DUPLICATE: "#ff9800",
+      VOTING: "#2196f3",
+      NOMINATED: "#9c27b0",
+      NIANTIC_REVIEW: "#795548",
+      APPEALED: "#009688",
+      WITHDRAWN: "#607d8b",
+      HELD: "#ffc107"
+    };
+
+    function renderVerticalStackedBarChart(areaRows) {
+      const chart = document.getElementById("wfns-plot-chart");
+      if (!chart) return;
+
+      chart.innerHTML = "";
+
+      if (!areaRows.length) {
+        chart.textContent = "No nominations match the current filters.";
+        return;
+      }
+
+      const maxTotal = Math.max(...areaRows.map(row => row.total));
+
+      const outer = document.createElement("div");
+      outer.style.cssText = `
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        background: #fff;
+        padding: 16px;
+      `;
+
+      const title = document.createElement("div");
+      title.textContent = "Nominations by Area";
+      title.style.cssText = "font-weight: 700; margin-bottom: 12px;";
+      outer.appendChild(title);
+
+      const barsWrap = document.createElement("div");
+      barsWrap.style.cssText = `
+        display: flex;
+        align-items: flex-end;
+        gap: 12px;
+        min-height: 280px;
+        padding: 12px 0 4px 0;
+        border-bottom: 1px solid #ccc;
+        overflow-x: auto;
+      `;
+
+      areaRows.forEach(row => {
+        const col = document.createElement("div");
+        col.style.cssText = `
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          min-width: 56px;
+          flex: 0 0 auto;
+        `;
+
+        const totalLabel = document.createElement("div");
+        totalLabel.textContent = row.total;
+        totalLabel.style.cssText = `
+          font-size: 12px;
+          margin-bottom: 6px;
+          color: #333;
+        `;
+
+        const barOuter = document.createElement("div");
+        barOuter.style.cssText = `
+          width: 42px;
+          height: 220px;
+          display: flex;
+          flex-direction: column-reverse;
+          justify-content: flex-start;
+          border: 1px solid #bbb;
+          background: #f7f7f7;
+          border-radius: 4px 4px 0 0;
+          overflow: hidden;
+        `;
+
+        const scaledHeight = maxTotal > 0 ? (row.total / maxTotal) * 220 : 0;
+
+        const barInner = document.createElement("div");
+        barInner.style.cssText = `
+          width: 100%;
+          height: ${scaledHeight}px;
+          display: flex;
+          flex-direction: column-reverse;
+        `;
+
+        const statusesInBar = Array.from(plotState.selectedStatuses)
+          .filter(status => row.counts[status])
+          .sort((a, b) => row.counts[b] - row.counts[a]);
+
+        statusesInBar.forEach(status => {
+          const segment = document.createElement("div");
+          segment.style.width = "100%";
+          segment.style.height = `${(row.counts[status] / row.total) * scaledHeight}px`;
+          segment.style.background = STATUS_COLORS[status] || "#888";
+          segment.title = `${row.area} | ${status}: ${row.counts[status]}`;
+          barInner.appendChild(segment);
+        });
+
+        barOuter.appendChild(barInner);
+
+        const xLabel = document.createElement("div");
+        xLabel.textContent = row.area;
+        xLabel.style.cssText = `
+          margin-top: 8px;
+          font-size: 11px;
+          text-align: center;
+          max-width: 72px;
+          word-break: break-word;
+          line-height: 1.2;
+        `;
+
+        col.appendChild(totalLabel);
+        col.appendChild(barOuter);
+        col.appendChild(xLabel);
+        barsWrap.appendChild(col);
+      });
+
+      outer.appendChild(barsWrap);
+
+      const legend = document.createElement("div");
+      legend.style.cssText = `
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 12px;
+      `;
+
+      Array.from(plotState.selectedStatuses).forEach(status => {
+        const item = document.createElement("div");
+        item.style.cssText = `
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+        `;
+        item.innerHTML = `
+          <span style="display:inline-block;width:12px;height:12px;background:${STATUS_COLORS[status] || "#888"};border-radius:2px;"></span>
+          <span>${status}</span>
+        `;
+        legend.appendChild(item);
+      });
+
+      outer.appendChild(legend);
+      chart.appendChild(outer);
+    }
+
+    function renderPlots() {
+      const stackedData = buildStackedAreaData(nominations);
+      const topAreas = getTopAreas(stackedData, plotState.maxBars);
+      renderVerticalStackedBarChart(topAreas);
     }
 
     window.saveFile = typeof android === 'undefined' || !android.saveFile
