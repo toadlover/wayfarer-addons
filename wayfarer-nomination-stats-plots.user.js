@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.8
+// @version     0.0.9
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
@@ -85,7 +85,8 @@ function init() {
       selectedStatuses: new Set(["ACCEPTED"]),
       selectedTypes: new Set(["NOMINATION"]),
       aggregationMode: "cityState", // or "state"
-      maxBars: 20 // default number of bars to display in plot
+      maxBars: 20, // default number of bars to display in plot
+      timelineAreaFilter: "__ALL__"
     };
 
     //setup to be able to export plots as png
@@ -104,7 +105,7 @@ function init() {
       });
     }
 
-    async function exportCurrentPlotAsPng() {
+    async function exportAreaPlotAsPng() {
       await loadHtml2Canvas();
 
       const chart = document.getElementById("wfns-plot-chart");
@@ -158,6 +159,63 @@ function init() {
         barsWrap.style.width = original.barsWrapWidth;
         barsWrap.style.overflow = original.barsWrapOverflow;
         barsWrap.style.overflowX = original.barsWrapOverflowX;
+      }
+    }
+
+    async function exportTimelinePlotAsPng() {
+      await loadHtml2Canvas();
+
+      const chart = document.getElementById("wfns-timeline-chart");
+      const timelineWrap = document.getElementById("wfns-timeline-wrap");
+
+      if (!chart || !timelineWrap) {
+        console.log("Timeline export failed: chart or timelineWrap not found.");
+        return;
+      }
+
+      const original = {
+        chartWidth: chart.style.width,
+        chartOverflow: chart.style.overflow,
+        wrapWidth: timelineWrap.style.width,
+        wrapOverflow: timelineWrap.style.overflow,
+        wrapOverflowX: timelineWrap.style.overflowX,
+      };
+
+      try {
+        const fullWidth = Math.max(timelineWrap.scrollWidth, timelineWrap.clientWidth);
+
+        timelineWrap.style.width = `${fullWidth}px`;
+        timelineWrap.style.overflow = "visible";
+        timelineWrap.style.overflowX = "visible";
+
+        chart.style.width = `${fullWidth + 40}px`;
+        chart.style.overflow = "visible";
+
+        const canvas = await html2canvas(chart, {
+          backgroundColor: "#ffffff",
+          scale: 2,
+          useCORS: true
+        });
+
+        const link = document.createElement("a");
+        const mode = plotState.aggregationMode === "state" ? "state" : "citystate";
+        const areaPart =
+          plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
+            ? plotState.timelineAreaFilter.replace(/[^a-zA-Z0-9_-]+/g, "_")
+            : "allareas";
+        const date = new Date().toISOString().slice(0, 10);
+
+        link.download = `wayfarer_timeline_${mode}_${areaPart}_${date}.png`;
+        link.href = canvas.toDataURL("image/png");
+        link.click();
+      } catch (err) {
+        console.log("Timeline export failed:", err);
+      } finally {
+        chart.style.width = original.chartWidth;
+        chart.style.overflow = original.chartOverflow;
+        timelineWrap.style.width = original.wrapWidth;
+        timelineWrap.style.overflow = original.wrapOverflow;
+        timelineWrap.style.overflowX = original.wrapOverflowX;
       }
     }
 
@@ -827,6 +885,7 @@ function init() {
             <div class="content-inner" id="wfns-plots-inner">
               <div id="wfns-plot-controls"></div>
               <div id="wfns-plot-chart"></div>
+              <div id="wfns-timeline-chart" style="margin-top: 20px;"></div>
             </div>
           </div>
         </div>
@@ -888,6 +947,16 @@ function init() {
       `;
       wrapper.appendChild(aggBlock);
 
+      // Timeline area selector
+      const timelineAreaBlock = document.createElement("div");
+      timelineAreaBlock.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 6px;">Timeline area</div>
+        <select id="wfns-timeline-area" style="padding: 4px 6px; border-radius: 4px;">
+          <option value="__ALL__">All areas</option>
+        </select>
+      `;
+      wrapper.appendChild(timelineAreaBlock);
+
       // Type selector
       const typeBlock = document.createElement("div");
       typeBlock.innerHTML = `<div style="font-weight: 600; margin-bottom: 6px;">Types</div>`;
@@ -918,11 +987,72 @@ function init() {
       });
       wrapper.appendChild(statusBlock);
 
+      // Export buttons
+      const exportAreaBlock = document.createElement("div");
+      exportAreaBlock.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 6px;">Export area plot</div>
+        <button id="wfns-export-area-image" style="
+          padding: 6px 10px;
+          border-radius: 4px;
+          border: none;
+          background: #e5e5e5;
+          cursor: pointer;
+        ">
+          Download Area PNG
+        </button>
+      `;
+      wrapper.appendChild(exportAreaBlock);
+
+      const exportTimelineBlock = document.createElement("div");
+      exportTimelineBlock.innerHTML = `
+        <div style="font-weight: 600; margin-bottom: 6px;">Export timeline plot</div>
+        <button id="wfns-export-timeline-image" style="
+          padding: 6px 10px;
+          border-radius: 4px;
+          border: none;
+          background: #e5e5e5;
+          cursor: pointer;
+        ">
+          Download Timeline PNG
+        </button>
+      `;
+      wrapper.appendChild(exportTimelineBlock);
+
       controls.appendChild(wrapper);
 
+      // Populate timeline area dropdown
+      const timelineAreaSelect = controls.querySelector("#wfns-timeline-area");
+      if (timelineAreaSelect) {
+        const areas = getAvailableAreas(nominations);
+
+        if (
+          plotState.timelineAreaFilter !== "__ALL__" &&
+          !areas.includes(plotState.timelineAreaFilter)
+        ) {
+          plotState.timelineAreaFilter = "__ALL__";
+        }
+
+        areas.forEach(area => {
+          const option = document.createElement("option");
+          option.value = area;
+          option.textContent = area;
+          timelineAreaSelect.appendChild(option);
+        });
+
+        timelineAreaSelect.value = plotState.timelineAreaFilter;
+
+        timelineAreaSelect.addEventListener("change", (e) => {
+          plotState.timelineAreaFilter = e.target.value;
+          renderPlots();
+        });
+      }
+
+      // Event listeners
       controls.querySelectorAll('input[name="wfns-agg"]').forEach(input => {
         input.addEventListener("change", (e) => {
           plotState.aggregationMode = e.target.value;
+          plotState.timelineAreaFilter = "__ALL__";
+          renderPlotControls();
           renderPlots();
         });
       });
@@ -959,28 +1089,19 @@ function init() {
         });
       }
 
-      const exportBlock = document.createElement("div");
-      exportBlock.innerHTML = `
-        <div style="font-weight: 600; margin-bottom: 6px;">Export</div>
-        <button id="wfns-export-image" style="
-          padding: 6px 10px;
-          border-radius: 4px;
-          border: none;
-          background: #e5e5e5;
-          cursor: pointer;
-        ">
-          Download PNG
-        </button>
-      `;
-      wrapper.appendChild(exportBlock);
-
-      const exportBtn = wrapper.querySelector("#wfns-export-image");
-      if (exportBtn) {
-        exportBtn.addEventListener("click", () => {
-          exportCurrentPlotAsPng();
+      const exportAreaBtn = controls.querySelector("#wfns-export-area-image");
+      if (exportAreaBtn) {
+        exportAreaBtn.addEventListener("click", () => {
+          exportAreaPlotAsPng();
         });
       }
 
+      const exportTimelineBtn = controls.querySelector("#wfns-export-timeline-image");
+      if (exportTimelineBtn) {
+        exportTimelineBtn.addEventListener("click", () => {
+          exportTimelinePlotAsPng();
+        });
+      }
     }
 
     function getAreaLabel(nomination, aggregationMode) {
@@ -1203,16 +1324,296 @@ function init() {
       chart.appendChild(outer);
     }
 
+    function getMonthKey(nomination) {
+      if (!nomination.day) return "Unknown";
+
+      const d = new Date(nomination.day);
+      if (isNaN(d)) return "Unknown";
+
+      const year = d.getFullYear();
+      const month = String(d.getMonth() + 1).padStart(2, "0");
+
+      return `${year}-${month}`;
+    }
+
+    function buildTimelineLineData(nominations) {
+      const allMonths = new Set();
+      const countsByStatus = {};
+
+      PLOT_STATUS_TYPES.forEach(status => {
+        if (plotState.selectedStatuses.has(status)) {
+          countsByStatus[status] = {};
+        }
+      });
+
+      nominations.forEach(nomination => {
+        if (!nomination) return;
+        if (!plotState.selectedStatuses.has(nomination.status)) return;
+
+        const typeMatch = Array.from(plotState.selectedTypes).some(type =>
+          nominationMatchesSelectedType(nomination, type)
+        );
+        if (!typeMatch) return;
+
+        const area = getAreaLabel(nomination, plotState.aggregationMode);
+        if (
+          plotState.timelineAreaFilter &&
+          plotState.timelineAreaFilter !== "__ALL__" &&
+          area !== plotState.timelineAreaFilter
+        ) {
+          return;
+        }
+
+        const month = getMonthKey(nomination);
+        if (!month || month === "Unknown") return;
+
+        allMonths.add(month);
+
+        if (!countsByStatus[nomination.status]) {
+          countsByStatus[nomination.status] = {};
+        }
+
+        countsByStatus[nomination.status][month] =
+          (countsByStatus[nomination.status][month] || 0) + 1;
+      });
+
+      const months = Array.from(allMonths).sort();
+
+      const series = Object.keys(countsByStatus).map(status => ({
+        key: status,
+        label: STATUS_DISPLAY[status] || status,
+        values: months.map(month => ({
+          month,
+          count: countsByStatus[status][month] || 0
+        }))
+      }));
+
+      return { months, series };
+    }
+
+    function getSortedTimelineRows(timelineData) {
+      return Object.entries(timelineData)
+        .map(([month, counts]) => {
+          const total = Object.values(counts).reduce((a, b) => a + b, 0);
+          return { month, counts, total };
+        })
+        .sort((a, b) => a.month.localeCompare(b.month)); // chronological
+    }
+
+    function renderTimelineChart(timelineData) {
+      const chart = document.getElementById("wfns-timeline-chart");
+      if (!chart) return;
+
+      chart.innerHTML = "";
+
+      const { months, series } = timelineData;
+
+      if (!months.length || !series.length) {
+        chart.textContent = "No timeline data for selected filters.";
+        return;
+      }
+
+      const outer = document.createElement("div");
+      outer.style.cssText = `
+        border: 1px solid #ddd;
+        border-radius: 8px;
+        background: #fff;
+        padding: 16px;
+      `;
+
+      const title = document.createElement("div");
+      const areaText =
+        plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
+          ? ` (${plotState.timelineAreaFilter})`
+          : " (All areas)";
+      title.textContent = `Nominations Over Time${areaText}`;
+      title.style.cssText = "font-weight: 700; margin-bottom: 12px; color: #000;";
+      outer.appendChild(title);
+
+      const maxY = Math.max(
+        1,
+        ...series.flatMap(s => s.values.map(v => v.count))
+      );
+
+      const width = Math.max(700, months.length * 70);
+      const height = 320;
+      const margin = { top: 20, right: 20, bottom: 60, left: 50 };
+      const innerWidth = width - margin.left - margin.right;
+      const innerHeight = height - margin.top - margin.bottom;
+
+      const svgNS = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(svgNS, "svg");
+      svg.setAttribute("width", width);
+      svg.setAttribute("height", height);
+      svg.style.display = "block";
+      svg.style.background = "#fff";
+
+      const xStep = months.length > 1 ? innerWidth / (months.length - 1) : 0;
+      const getX = (i) => margin.left + (months.length > 1 ? i * xStep : innerWidth / 2);
+      const getY = (v) => margin.top + innerHeight - (v / maxY) * innerHeight;
+
+      const xAxis = document.createElementNS(svgNS, "line");
+      xAxis.setAttribute("x1", margin.left);
+      xAxis.setAttribute("y1", margin.top + innerHeight);
+      xAxis.setAttribute("x2", margin.left + innerWidth);
+      xAxis.setAttribute("y2", margin.top + innerHeight);
+      xAxis.setAttribute("stroke", "#333");
+      svg.appendChild(xAxis);
+
+      const yAxis = document.createElementNS(svgNS, "line");
+      yAxis.setAttribute("x1", margin.left);
+      yAxis.setAttribute("y1", margin.top);
+      yAxis.setAttribute("x2", margin.left);
+      yAxis.setAttribute("y2", margin.top + innerHeight);
+      yAxis.setAttribute("stroke", "#333");
+      svg.appendChild(yAxis);
+
+      // y-axis ticks and labels
+      const tickCount = 5;
+      for (let i = 0; i <= tickCount; i++) {
+        const value = Math.round((maxY * i) / tickCount);
+        const y = getY(value);
+
+        const tick = document.createElementNS(svgNS, "line");
+        tick.setAttribute("x1", margin.left - 5);
+        tick.setAttribute("y1", y);
+        tick.setAttribute("x2", margin.left);
+        tick.setAttribute("y2", y);
+        tick.setAttribute("stroke", "#333");
+        svg.appendChild(tick);
+
+        const grid = document.createElementNS(svgNS, "line");
+        grid.setAttribute("x1", margin.left);
+        grid.setAttribute("y1", y);
+        grid.setAttribute("x2", margin.left + innerWidth);
+        grid.setAttribute("y2", y);
+        grid.setAttribute("stroke", "#ddd");
+        grid.setAttribute("stroke-dasharray", "2,2");
+        svg.appendChild(grid);
+
+        const label = document.createElementNS(svgNS, "text");
+        label.setAttribute("x", margin.left - 8);
+        label.setAttribute("y", y + 4);
+        label.setAttribute("text-anchor", "end");
+        label.setAttribute("font-size", "11");
+        label.setAttribute("fill", "#000");
+        label.textContent = value;
+        svg.appendChild(label);
+      }
+
+      const yTitle = document.createElementNS(svgNS, "text");
+      yTitle.setAttribute("x", 14);
+      yTitle.setAttribute("y", margin.top + innerHeight / 2);
+      yTitle.setAttribute("text-anchor", "middle");
+      yTitle.setAttribute("font-size", "12");
+      yTitle.setAttribute("fill", "#000");
+      yTitle.setAttribute("transform", `rotate(-90 14 ${margin.top + innerHeight / 2})`);
+      yTitle.textContent = "Count";
+      svg.appendChild(yTitle);
+
+      months.forEach((month, i) => {
+        const label = document.createElementNS(svgNS, "text");
+        label.setAttribute("x", getX(i));
+        label.setAttribute("y", margin.top + innerHeight + 18);
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("font-size", "11");
+        label.setAttribute("fill", "#000");
+        label.textContent = month;
+        svg.appendChild(label);
+      });
+
+      series.forEach(s => {
+        const color = STATUS_COLORS[s.key] || "#888";
+        const points = s.values.map((v, i) => `${getX(i)},${getY(v.count)}`).join(" ");
+
+        const polyline = document.createElementNS(svgNS, "polyline");
+        polyline.setAttribute("fill", "none");
+        polyline.setAttribute("stroke", color);
+        polyline.setAttribute("stroke-width", "2.5");
+        polyline.setAttribute("points", points);
+        svg.appendChild(polyline);
+
+        s.values.forEach((v, i) => {
+          const circle = document.createElementNS(svgNS, "circle");
+          circle.setAttribute("cx", getX(i));
+          circle.setAttribute("cy", getY(v.count));
+          circle.setAttribute("r", "3");
+          circle.setAttribute("fill", color);
+
+          const titleNode = document.createElementNS(svgNS, "title");
+          titleNode.textContent = `${s.label} | ${v.month}: ${v.count}`;
+          circle.appendChild(titleNode);
+
+          svg.appendChild(circle);
+        });
+      });
+
+      const svgWrap = document.createElement("div");
+      svgWrap.id = "wfns-timeline-wrap";
+      svgWrap.style.cssText = `
+        overflow-x: auto;
+        padding-bottom: 6px;
+      `;
+      svgWrap.appendChild(svg);
+      outer.appendChild(svgWrap);
+
+      const legend = document.createElement("div");
+      legend.style.cssText = `
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 12px;
+      `;
+
+      series.forEach(s => {
+        const color = STATUS_COLORS[s.key] || "#888";
+        const item = document.createElement("div");
+        item.style.cssText = `
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          font-size: 12px;
+          color: #000;
+        `;
+        item.innerHTML = `
+          <span style="display:inline-block;width:12px;height:12px;background:${color};border-radius:2px;"></span>
+          <span>${s.label}</span>
+        `;
+        legend.appendChild(item);
+      });
+
+      outer.appendChild(legend);
+      chart.appendChild(outer);
+    }
+
     function renderPlots() {
+    //location plot
       const stackedData = buildStackedAreaData(nominations);
       const topAreas = getTopAreas(stackedData, plotState.maxBars);
       renderVerticalStackedBarChart(topAreas);
+
+      //timeline plot
+      const timelineData = buildTimelineLineData(nominations);
+      renderTimelineChart(timelineData);
     }
 
     window.saveFile = typeof android === 'undefined' || !android.saveFile
           ? saveAs : function (data,filename,dataType) {
       android.saveFile(filename || '', dataType || '*/*', data);
     };
+
+    function getAvailableAreas(nominations) {
+      const areas = Array.from(
+        new Set(
+          nominations
+            .filter(n => n)
+            .map(n => getAreaLabel(n, plotState.aggregationMode))
+        )
+      ).sort();
+
+      return areas;
+    }
+
 }
 
 init();
