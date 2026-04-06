@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.12
+// @version     0.0.13
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
@@ -333,6 +333,29 @@ function init() {
                 border-bottom-right-radius: 7px;
                 padding: .5rem 1rem;
             }
+
+            /* Force controls text to black */
+            #wfns-plots-root select,
+            #wfns-plots-root button {
+                color: #000 !important;
+            }
+
+            /* Ensure dropdown text + options are readable */
+            #wfns-plots-root select option {
+                color: #000;
+            }
+
+            /* Labels (like "Max bars", "Timeline area", etc.) */
+            #wfns-plots-root div {
+                color: #000;
+            }
+
+            /* Buttons specifically */
+            #wfns-plots-root button {
+                color: #000 !important;
+                font-weight: 500;
+            }
+
             `;
         const style = document.createElement('style');
         style.type = 'text/css';
