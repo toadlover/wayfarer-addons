@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.9
+// @version     0.0.10
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
@@ -916,6 +916,7 @@ function init() {
         gap: 20px;
         margin-bottom: 16px;
         align-items: flex-start;
+        justify-content: space-between;
       `;
 
       // Max bars selector
@@ -988,35 +989,45 @@ function init() {
       wrapper.appendChild(statusBlock);
 
       // Export buttons
-      const exportAreaBlock = document.createElement("div");
-      exportAreaBlock.innerHTML = `
-        <div style="font-weight: 600; margin-bottom: 6px;">Export area plot</div>
-        <button id="wfns-export-area-image" style="
-          padding: 6px 10px;
-          border-radius: 4px;
-          border: none;
-          background: #e5e5e5;
-          cursor: pointer;
-        ">
-          Download Area PNG
-        </button>
+      const exportBlock = document.createElement("div");
+      exportBlock.style.cssText = `
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        margin-left: auto;
+        min-width: 180px;
       `;
-      wrapper.appendChild(exportAreaBlock);
 
-      const exportTimelineBlock = document.createElement("div");
-      exportTimelineBlock.innerHTML = `
-        <div style="font-weight: 600; margin-bottom: 6px;">Export timeline plot</div>
-        <button id="wfns-export-timeline-image" style="
-          padding: 6px 10px;
-          border-radius: 4px;
-          border: none;
-          background: #e5e5e5;
-          cursor: pointer;
-        ">
-          Download Timeline PNG
-        </button>
+      exportBlock.innerHTML = `
+        <div>
+          <div style="font-weight: 600; margin-bottom: 6px;">Export area plot</div>
+          <button id="wfns-export-area-image" style="
+            padding: 6px 10px;
+            border-radius: 4px;
+            border: none;
+            background: #e5e5e5;
+            cursor: pointer;
+            width: 100%;
+          ">
+            Download Area PNG
+          </button>
+        </div>
+
+        <div>
+          <div style="font-weight: 600; margin-bottom: 6px;">Export timeline plot</div>
+          <button id="wfns-export-timeline-image" style="
+            padding: 6px 10px;
+            border-radius: 4px;
+            border: none;
+            background: #e5e5e5;
+            cursor: pointer;
+            width: 100%;
+          ">
+            Download Timeline PNG
+          </button>
+        </div>
       `;
-      wrapper.appendChild(exportTimelineBlock);
+      wrapper.appendChild(exportBlock);
 
       controls.appendChild(wrapper);
 
@@ -1336,8 +1347,27 @@ function init() {
       return `${year}-${month}`;
     }
 
+    function buildContinuousMonthRange(minMonth, maxMonth) {
+      const months = [];
+      if (!minMonth || !maxMonth) return months;
+
+      let [year, month] = minMonth.split("-").map(Number);
+      const [maxYear, maxMonthNum] = maxMonth.split("-").map(Number);
+
+      while (year < maxYear || (year === maxYear && month <= maxMonthNum)) {
+        months.push(`${year}-${String(month).padStart(2, "0")}`);
+        month += 1;
+        if (month > 12) {
+          month = 1;
+          year += 1;
+        }
+      }
+
+      return months;
+    }
+
     function buildTimelineLineData(nominations) {
-      const allMonths = new Set();
+      const observedMonths = [];
       const countsByStatus = {};
 
       PLOT_STATUS_TYPES.forEach(status => {
@@ -1367,7 +1397,7 @@ function init() {
         const month = getMonthKey(nomination);
         if (!month || month === "Unknown") return;
 
-        allMonths.add(month);
+        observedMonths.push(month);
 
         if (!countsByStatus[nomination.status]) {
           countsByStatus[nomination.status] = {};
@@ -1377,7 +1407,14 @@ function init() {
           (countsByStatus[nomination.status][month] || 0) + 1;
       });
 
-      const months = Array.from(allMonths).sort();
+      if (!observedMonths.length) {
+        return { months: [], series: [] };
+      }
+
+      observedMonths.sort();
+      const minMonth = observedMonths[0];
+      const maxMonth = observedMonths[observedMonths.length - 1];
+      const months = buildContinuousMonthRange(minMonth, maxMonth);
 
       const series = Object.keys(countsByStatus).map(status => ({
         key: status,
