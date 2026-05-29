@@ -17,9 +17,6 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 // GNU General Public License for more details.
 
-
-/* eslint-env es6 */
-/* eslint no-var: "error" */
 /*
  * Wayfarer Review Approval Checker
  *
@@ -29,8 +26,10 @@
  *
  * Status rules:
  * - Exact coordinate found in map GCS data: Approved
- * - Exact coordinate not found and review age < 7 days: Reviewing (<7 days)
- * - Exact coordinate not found and review age >= 7 days: Likely rejected
+ * - Exact coordinate not found: automatically checks same-name wayspots within 100m.
+ * - Same-name wayspot found within 100m: Approved relocated, persisted with distance and new coordinate
+ * - Still not found and review age < your configured threshold: Reviewing
+ * - Still not found and review age >= your configured threshold: Likely rejected
  */
 
 (function () {
@@ -42,11 +41,12 @@
     const LIVE_ENDPOINT = "/api/v1/vault/live-pois-in-radius";
     const CELL_LEVEL = 14;
 
-    const MAX_ROWS = 5000; // safety cap only; normal listing is all nomination reviews from the last 14 days
-    const LIST_DAYS = 14;
-    const REVIEWING_DAYS = 7;
+    const HARD_MAX_ROWS = 2000; // hard cap requested by user
+    const DEFAULT_LIST_DAYS = 14;
+    const DEFAULT_REVIEWING_DAYS = 7;
     const REQUEST_DELAY_MS = 120;
-    const CONCURRENT_CHECKS = 3; // roughly 3x faster than the old single-file queue
+    const CONCURRENT_CHECKS = 18; // 6x more than v0.5.4's 3 parallel checks
+    const RELOCATION_RADIUS_M = 100;
     const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours for pending/rejected checks
 
     const PANEL_ID = "wf-review-approval-checker";
@@ -58,12 +58,65 @@
         "wf_review_approval_checker_v1:"
     ];
     const STATS_KEY = "wf_review_approval_checker_stats_v5";
+    const SETTINGS_KEY = "wf_review_approval_checker_settings_v1";
     const MAX_CACHE_ENTRIES = 6000;
 
     let userHash = null;
     let inserted = false;
     let activeChecks = 0;
     const pendingChecks = [];
+
+    function clampInt(value, fallback, min, max) {
+        const n = parseInt(value, 10);
+        if (!Number.isFinite(n)) return fallback;
+        return Math.max(min, Math.min(max, n));
+    }
+
+    function loadSettings() {
+        let parsed = null;
+        try {
+            parsed = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "null");
+        } catch (_) {
+            parsed = null;
+        }
+
+        const settings = {
+            reviewingDays: DEFAULT_REVIEWING_DAYS,
+            listDays: String(DEFAULT_LIST_DAYS)
+        };
+
+        if (parsed && typeof parsed === "object") {
+            settings.reviewingDays = clampInt(parsed.reviewingDays, DEFAULT_REVIEWING_DAYS, 1, 365);
+            if (parsed.listDays === "unlimited") {
+                settings.listDays = "unlimited";
+            } else {
+                settings.listDays = String(clampInt(parsed.listDays, DEFAULT_LIST_DAYS, 1, 3650));
+            }
+        }
+
+        return settings;
+    }
+
+    function saveSettings(settings) {
+        try {
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        } catch (_) {}
+    }
+
+    function getReviewingDays() {
+        return loadSettings().reviewingDays;
+    }
+
+    function getCutoffDays() {
+        const value = loadSettings().listDays;
+        if (value === "unlimited") return null;
+        return clampInt(value, DEFAULT_LIST_DAYS, 1, 3650);
+    }
+
+    function getCutoffLabel() {
+        const days = getCutoffDays();
+        return days == null ? "unlimited history" : `last ${days} days`;
+    }
 
     // Same hash used by Wayfarer Review History.
     function cyrb53(str, seed = 0) {
@@ -277,6 +330,32 @@
         return Math.abs(latE6 - wantedLatE6) <= 1 && Math.abs(lngE6 - wantedLngE6) <= 1;
     }
 
+    function normalizeTitleForMatch(value) {
+        return String(value || "")
+            .normalize("NFC")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toLocaleLowerCase();
+    }
+
+    function poiLatLng(p) {
+        const lat = (typeof p?.latE6 === "number") ? p.latE6 / 1e6 : Number(p?.lat);
+        const lng = (typeof p?.lngE6 === "number") ? p.lngE6 / 1e6 : Number(p?.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+        return { lat, lng };
+    }
+
+    function distanceMeters(aLat, aLng, bLat, bLng) {
+        const toRad = deg => deg * Math.PI / 180;
+        const R = 6371000;
+        const dLat = toRad(bLat - aLat);
+        const dLng = toRad(bLng - aLng);
+        const lat1 = toRad(aLat);
+        const lat2 = toRad(bLat);
+        const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+        return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+    }
+
     function extractPoisFromGcs(json) {
         const out = [];
         const cells = json?.result?.data;
@@ -302,7 +381,7 @@
     }
 
     function emptyCompactCache() {
-        return { version: 5, createdAt: Date.now(), updatedAt: Date.now(), items: {} };
+        return { version: 6, createdAt: Date.now(), updatedAt: Date.now(), items: {} };
     }
 
     function normalizeCompactEntry(entry, record) {
@@ -316,14 +395,34 @@
         if (state !== "approved") {
             const cachedAt = Number(entry.t || entry.cachedAt || 0);
             if (!cachedAt || Date.now() - cachedAt > CACHE_TTL_MS) return null;
+
+            // v0.5.11+ non-approved cache is only trusted when the 100m nearby relocation
+            // check has also been done. Older non-approved cache is ignored and recalculated.
+            if (!(entry.n === 1 || entry.nearbyChecked)) return null;
+
+            // Non-approved cache only means "not found exact or same-name nearby at last check".
+            // Whether that is Reviewing or Likely rejected depends on the current age threshold setting.
+            const age = record?.ageDays;
+            if (age != null) state = age < getReviewingDays() ? "reviewing" : "likely-rejected";
         }
 
         if (state === "approved") {
+            const rawPoi = entry.p || null;
+            const poi = rawPoi && typeof rawPoi === "object"
+                ? {
+                    title: rawPoi.title || "",
+                    lat: Number(rawPoi.lat),
+                    lng: Number(rawPoi.lng),
+                    distanceMeters: Number(rawPoi.d || rawPoi.distanceMeters || 0)
+                }
+                : rawPoi ? { title: String(rawPoi) } : null;
+            const relocated = !!(entry.relocated || entry.m === 1 || (poi && Number.isFinite(poi.distanceMeters) && poi.distanceMeters > 0));
             return {
                 state: "approved",
-                label: "Approved",
+                label: relocated ? formatRelocatedLabel(poi?.distanceMeters, poi?.lat, poi?.lng) : "Approved",
                 className: "wfap-status-approved",
-                poi: entry.p ? { title: entry.p } : null,
+                poi,
+                relocated,
                 checkedAt: Number(entry.t || entry.cachedAt || Date.now())
             };
         }
@@ -332,7 +431,7 @@
             const age = record?.ageDays;
             return {
                 state: "reviewing",
-                label: (age != null) ? `Reviewing (${age}d / <${REVIEWING_DAYS}d)` : "Reviewing",
+                label: (age != null) ? `Reviewing (${age}d / <${getReviewingDays()}d)` : "Reviewing",
                 className: "wfap-status-reviewing",
                 poi: null,
                 checkedAt: Number(entry.t || entry.cachedAt || Date.now())
@@ -457,11 +556,25 @@
     function setCachedStatus(key, value) {
         try {
             const cache = loadCompactCache();
-            cache.items[key] = {
+            const item = {
                 s: value.state === "approved" ? "a" : value.state === "reviewing" ? "r" : "l",
-                t: Date.now(),
-                p: value.poi?.title ? String(value.poi.title).slice(0, 120) : ""
+                t: Date.now()
             };
+
+            if (value.poi?.title || value.poi?.lat != null || value.poi?.lng != null) {
+                item.p = {
+                    title: value.poi?.title ? String(value.poi.title).slice(0, 120) : "",
+                    lat: Number.isFinite(Number(value.poi?.lat)) ? Number(value.poi.lat) : undefined,
+                    lng: Number.isFinite(Number(value.poi?.lng)) ? Number(value.poi.lng) : undefined,
+                    d: Number.isFinite(Number(value.poi?.distanceMeters)) ? Math.round(Number(value.poi.distanceMeters)) : undefined
+                };
+                Object.keys(item.p).forEach(k => item.p[k] === undefined && delete item.p[k]);
+            }
+
+            if (value.relocated || value.label?.toLowerCase?.().includes("relocated")) item.relocated = true;
+            if (value.nearbyChecked && item.s !== "a") item.n = 1;
+
+            cache.items[key] = item;
             pruneCompactCache();
             saveCompactCache();
         } catch (_) {}
@@ -499,6 +612,55 @@
         return exact ? normalizePoiForDisplay(exact) : null;
     }
 
+    async function queryGcsNearbyName(lat, lng, title, radiusM = RELOCATION_RADIUS_M) {
+        const titleKey = normalizeTitleForMatch(title);
+        if (!titleKey) return null;
+
+        const latDelta = radiusM / 111320;
+        const lngDelta = radiusM / (111320 * Math.max(0.2, Math.cos(lat * Math.PI / 180)));
+        const neLat = lat + latDelta;
+        const neLng = lng + lngDelta;
+        const swLat = lat - latDelta;
+        const swLng = lng - lngDelta;
+
+        const url =
+            `${GCS_ENDPOINT}` +
+            `?ne=(${neLat},${neLng})` +
+            `&sw=(${swLat},${swLng})` +
+            `&cellLevel=${CELL_LEVEL}`;
+
+        const res = await fetch(url, {
+            method: "GET",
+            credentials: "include"
+        });
+
+        if (!res.ok) throw new Error("GCS nearby HTTP " + res.status);
+
+        const json = await res.json();
+        if (json?.captcha) throw new Error("Wayfarer requested captcha.");
+        if (json?.code && json.code !== "OK") throw new Error("GCS nearby returned " + json.code);
+
+        const pois = extractPoisFromGcs(json);
+        let best = null;
+        let bestDistance = Infinity;
+
+        for (const poi of pois) {
+            if (normalizeTitleForMatch(poi?.title) !== titleKey) continue;
+            const ll = poiLatLng(poi);
+            if (!ll) continue;
+            const meters = distanceMeters(lat, lng, ll.lat, ll.lng);
+            if (meters <= radiusM && meters < bestDistance) {
+                best = poi;
+                bestDistance = meters;
+            }
+        }
+
+        if (!best) return null;
+        const normalized = normalizePoiForDisplay(best);
+        normalized.distanceMeters = bestDistance;
+        return normalized;
+    }
+
     async function queryLivePoisExact(lat, lng) {
         // Fallback only. GCS is the main map source; live-pois can catch some active game objects.
         const url = `${LIVE_ENDPOINT}?lat=${lat}&lng=${lng}&radius=80`;
@@ -528,7 +690,7 @@
         }
 
         const found = await queryGcsExact(record.lat, record.lng).catch(err => {
-            console.warn("[WF Approval Checker] GCS check failed:", err);
+            console.warn("[WF Approval Checker] GCS exact check failed:", err);
             return null;
         }) || await queryLivePoisExact(record.lat, record.lng).catch(() => null);
 
@@ -541,24 +703,88 @@
                 poi: found,
                 checkedAt: Date.now()
             };
-        } else if (record.ageDays != null && record.ageDays < REVIEWING_DAYS) {
+            setCachedStatus(record.key, result);
+            return result;
+        }
+
+        // Better v0.5.11 logic: if the exact pin is not present, immediately check
+        // whether the approved wayspot was relocated within 100m under the same name.
+        const relocated = await queryGcsNearbyName(record.lat, record.lng, record.title, RELOCATION_RADIUS_M).catch(err => {
+            console.warn("[WF Approval Checker] GCS nearby relocation check failed:", err);
+            return null;
+        });
+
+        if (relocated) {
+            const meters = Math.round(relocated.distanceMeters || 0);
+            result = {
+                state: "approved",
+                label: formatRelocatedLabel(meters, relocated.lat, relocated.lng),
+                className: "wfap-status-approved",
+                poi: { ...relocated, distanceMeters: meters },
+                relocated: true,
+                checkedAt: Date.now()
+            };
+            setCachedStatus(record.key, result);
+            return result;
+        }
+
+        if (record.ageDays != null && record.ageDays < getReviewingDays()) {
             result = {
                 state: "reviewing",
-                label: `Reviewing (${record.ageDays}d / <${REVIEWING_DAYS}d)`,
+                label: `Reviewing (${record.ageDays}d / <${getReviewingDays()}d)\n(Relocated checked)`,
                 className: "wfap-status-reviewing",
                 poi: null,
+                nearbyChecked: true,
                 checkedAt: Date.now()
             };
         } else {
             result = {
                 state: "likely-rejected",
-                label: "Likely rejected",
+                label: "Likely rejected\n(Relocated checked)",
                 className: "wfap-status-rejected",
                 poi: null,
+                nearbyChecked: true,
                 checkedAt: Date.now()
             };
         }
 
+        setCachedStatus(record.key, result);
+        return result;
+    }
+
+    async function checkRelocatedRecord(record, force = false) {
+        if (!force) {
+            const cached = getCachedStatus(record.key, record);
+            if (cached?.state === "approved") return cached;
+        }
+
+        const found = await queryGcsNearbyName(record.lat, record.lng, record.title, RELOCATION_RADIUS_M).catch(err => {
+            console.warn("[WF Approval Checker] Nearby relocation check failed:", err);
+            return null;
+        });
+
+        if (!found) {
+            // Do not persist a special "rejected relocated-checked" state.
+            // The note is only for the current page session; after refresh it returns to normal Likely rejected.
+            return {
+                state: "likely-rejected",
+                label: "Likely rejected\n(Relocated checked)",
+                className: "wfap-status-rejected",
+                poi: null,
+                nearbyChecked: true,
+                checkedAt: Date.now()
+            };
+        }
+
+        const meters = Math.round(found.distanceMeters || 0);
+        const result = {
+            state: "approved",
+            label: formatRelocatedLabel(meters, found.lat, found.lng),
+            className: "wfap-status-approved",
+            poi: { ...found, distanceMeters: meters },
+            relocated: true,
+            checkedAt: Date.now()
+        };
         setCachedStatus(record.key, result);
         return result;
     }
@@ -598,6 +824,19 @@
         return `/new/mapview?${lat},${lng}`;
     }
 
+    function formatCoord(lat, lng) {
+        const nLat = Number(lat);
+        const nLng = Number(lng);
+        if (!Number.isFinite(nLat) || !Number.isFinite(nLng)) return "";
+        return `${nLat.toFixed(6)}, ${nLng.toFixed(6)}`;
+    }
+
+    function formatRelocatedLabel(distanceMeters, lat, lng) {
+        const meters = Math.round(Number(distanceMeters) || 0);
+        const coord = formatCoord(lat, lng);
+        return coord ? `Approved relocated (${meters}m)\n${coord}` : `Approved relocated (${meters}m)`;
+    }
+
     function setStatusCell(row, result) {
         const cell = row.querySelector(".wfap-status");
         if (!cell) return;
@@ -614,9 +853,11 @@
         }
 
         if (result.poi?.title) {
-            cell.title = `Matched map wayspot: ${result.poi.title}`;
+            const coord = formatCoord(result.poi.lat, result.poi.lng);
+            const distance = Number.isFinite(Number(result.poi.distanceMeters)) ? ` (${Math.round(Number(result.poi.distanceMeters))}m from reviewed pin)` : "";
+            cell.title = `Matched map wayspot: ${result.poi.title}${distance}${coord ? ` at ${coord}` : ""}`;
         } else {
-            cell.title = "";
+            cell.title = result.nearbyChecked ? `Nearby relocation check completed: no same-name wayspot within ${RELOCATION_RADIUS_M}m.` : "";
         }
 
         const panel = row.closest(`#${PANEL_ID}`);
@@ -712,18 +953,31 @@
                 <div>
                     <h2>Recent Review Map Status</h2>
                     <p>
-                        Loads all nomination reviews from the last ${LIST_DAYS} days, checks their exact coordinates against Wayfarer Map,
-                        then classifies them as Approved, Reviewing below ${REVIEWING_DAYS} days, or Likely rejected.
+                        Loads nomination reviews using your cutoff setting, checks their exact coordinates against Wayfarer Map,
+                        then classifies them as Approved, Reviewing, or Likely rejected using your chosen day threshold. The rejected-nearby check searches 100m around likely rejected pins and marks same-name relocated wayspots as approved relocated with distance and new coordinate. Rejected rows only show a temporary relocated-checked note and are not persisted as a special relocated state.
                     </p>
                 </div>
                 <div class="wfap-actions">
                     <button type="button" class="wfap-btn wfap-refresh">Reload history</button>
                     <button type="button" class="wfap-btn wfap-check-visible">Check unchecked</button>
+                    <button type="button" class="wfap-btn wfap-check-relocated">Recheck rejected nearby</button>
                 </div>
             </div>
             <div class="wfap-stats wfap-block"></div>
             <div class="wfap-summary wfap-block">Loading review history…</div>
             <div class="wfap-controls wfap-block">
+                <label>Rejected after: <input type="number" class="wfap-reviewing-days" min="1" max="365" step="1"> days</label>
+                <label>Load cutoff: <select class="wfap-list-days">
+                    <option value="7">7 days</option>
+                    <option value="14">14 days</option>
+                    <option value="15">15 days</option>
+                    <option value="30">30 days</option>
+                    <option value="60">60 days</option>
+                    <option value="90">90 days</option>
+                    <option value="180">180 days</option>
+                    <option value="365">365 days</option>
+                    <option value="unlimited">Unlimited</option>
+                </select></label>
                 <label>Search title: <input type="search" class="wfap-search" placeholder="Submission name"></label>
                 <label>Status: <select class="wfap-status-filter">
                     <option value="">All</option>
@@ -753,14 +1007,40 @@
             </div>
             <div class="wfap-visible-counts wfap-block"></div>
             <div class="wfap-table-wrap"></div>
+            <div class="wfap-analytics wfap-block"></div>
         `;
+
+        const initialSettings = loadSettings();
+        const reviewingInput = panel.querySelector(".wfap-reviewing-days");
+        const listDaysSelect = panel.querySelector(".wfap-list-days");
+        if (reviewingInput) reviewingInput.value = String(initialSettings.reviewingDays);
+        if (listDaysSelect) listDaysSelect.value = initialSettings.listDays;
 
         panel.querySelector(".wfap-refresh").addEventListener("click", () => renderTable(panel));
         panel.querySelector(".wfap-check-visible").addEventListener("click", () => checkAllRows(panel));
+        panel.querySelector(".wfap-check-relocated").addEventListener("click", () => checkRejectedNearbyRows(panel));
         panel.querySelector(".wfap-search").addEventListener("input", () => applyFiltersAndSort(panel));
         panel.querySelector(".wfap-status-filter").addEventListener("change", () => applyFiltersAndSort(panel));
         panel.querySelector(".wfap-review-filter").addEventListener("change", () => applyFiltersAndSort(panel));
         panel.querySelector(".wfap-sort").addEventListener("change", () => applyFiltersAndSort(panel));
+        if (reviewingInput) {
+            reviewingInput.addEventListener("change", () => {
+                const settings = loadSettings();
+                settings.reviewingDays = clampInt(reviewingInput.value, DEFAULT_REVIEWING_DAYS, 1, 365);
+                reviewingInput.value = String(settings.reviewingDays);
+                saveSettings(settings);
+                renderTable(panel);
+            });
+        }
+        if (listDaysSelect) {
+            listDaysSelect.addEventListener("change", () => {
+                const settings = loadSettings();
+                settings.listDays = listDaysSelect.value === "unlimited" ? "unlimited" : String(clampInt(listDaysSelect.value, DEFAULT_LIST_DAYS, 1, 3650));
+                listDaysSelect.value = settings.listDays;
+                saveSettings(settings);
+                renderTable(panel);
+            });
+        }
 
         renderPersistedStats(panel);
         await renderTable(panel);
@@ -784,15 +1064,15 @@
                 .filter(r => !r.type || String(r.type).toUpperCase() === "NEW")
                 .sort((a, b) => (b.ts || 0) - (a.ts || 0));
 
-            const rowsInLast14Days = nominationRows
-                .filter(r => r.ageDays == null || r.ageDays <= LIST_DAYS);
+            const cutoffDays = getCutoffDays();
+            const rowsMatchingCutoff = cutoffDays == null
+                ? nominationRows
+                : nominationRows.filter(r => r.ageDays == null || r.ageDays <= cutoffDays);
 
             // Listing rule:
-            // - If the last 14 days has 250+ nominations: show all nominations from the last 14 days, capped at 5000.
-            // - If the last 14 days has below 250 nominations: show the newest 250 nominations, even if some are older.
-            let rows = (rowsInLast14Days.length >= 250
-                ? rowsInLast14Days.slice(0, MAX_ROWS)
-                : nominationRows.slice(0, 250));
+            // - Use the selected cutoff window (for example 15 days, 30 days, or unlimited).
+            // - Always hard-cap displayed rows at 2000 to protect browser performance.
+            const rows = rowsMatchingCutoff.slice(0, HARD_MAX_ROWS);
 
             const table = document.createElement("table");
             table.className = "wfap-table";
@@ -820,11 +1100,9 @@
             updateStats(panel);
             applyFiltersAndSort(panel);
 
-            if (rowsInLast14Days.length >= 250) {
-                summary.textContent = `Loaded ${rows.length} nomination review-history records from the last ${LIST_DAYS} days with coordinates.`;
-            } else {
-                summary.textContent = `Loaded newest ${rows.length} nomination review-history records because only ${rowsInLast14Days.length} were found from the last ${LIST_DAYS} days.`;
-            }
+            const cutoffText = getCutoffLabel();
+            const capText = rowsMatchingCutoff.length > HARD_MAX_ROWS ? ` Showing newest ${HARD_MAX_ROWS} due to the hard cap.` : "";
+            summary.textContent = `Loaded ${rows.length}/${rowsMatchingCutoff.length} nomination review-history records from ${cutoffText} with coordinates.${capText}`;
             if (!rows.length) {
                 summary.textContent = `No nomination review-history records with coordinates were found. Review some nominations first, or import your Review History data.`;
             }
@@ -868,7 +1146,7 @@
         savePersistedStats(stats);
         const previous = loadPersistedStats();
         const date = new Date((previous || stats).updatedAt || Date.now()).toLocaleString();
-        statsEl.textContent = `Stats (general): ${stats.approved} approved • ${stats.reviewing} reviewing (<${REVIEWING_DAYS}d) • ${stats.rejected} likely rejected • ${stats.unchecked} not checked • ${stats.total} total. Last saved: ${date}`;
+        statsEl.textContent = `Stats (general): ${stats.approved} approved • ${stats.reviewing} reviewing (<${getReviewingDays()}d) • ${stats.rejected} likely rejected • ${stats.unchecked} not checked • ${stats.total} total. Last saved: ${date}`;
     }
 
     function renderPersistedStats(panel) {
@@ -877,7 +1155,7 @@
         const stats = loadPersistedStats();
         if (!stats) return;
         const date = new Date(stats.updatedAt || Date.now()).toLocaleString();
-        statsEl.textContent = `Stats (general, saved): ${stats.approved || 0} approved • ${stats.reviewing || 0} reviewing (<${REVIEWING_DAYS}d) • ${stats.rejected || 0} likely rejected • ${stats.unchecked || 0} not checked • ${stats.total || 0} total. Last saved: ${date}`;
+        statsEl.textContent = `Stats (general, saved): ${stats.approved || 0} approved • ${stats.reviewing || 0} reviewing (<${getReviewingDays()}d) • ${stats.rejected || 0} likely rejected • ${stats.unchecked || 0} not checked • ${stats.total || 0} total. Last saved: ${date}`;
     }
 
     function updateVisibleCounters(panel) {
@@ -915,6 +1193,126 @@
         }
 
         countsEl.textContent = `Stats (current search/sort): showing ${visibleRows.length}/${rows.length} rows • Your review: ${reviewCounts.approved} approved, ${reviewCounts.rejected} rejected, ${reviewCounts.duplicate} duplicate, ${reviewCounts.skipped} skipped, ${reviewCounts.pending} pending • Status: ${statusCounts.approved} approved, ${statusCounts.reviewing} reviewing, ${statusCounts.rejected} likely rejected, ${statusCounts.unchecked} not checked`;
+        updateAnalytics(panel);
+    }
+
+    function percent(n, d) {
+        if (!d) return "0.0%";
+        return `${((n / d) * 100).toFixed(1)}%`;
+    }
+
+    function resolvedKindFromRow(row) {
+        const status = row.dataset.status || "";
+        if (status === "approved") return "approved";
+        if (status === "likely-rejected") return "rejected";
+        return ""; // excludes reviewing, unchecked, checking, errors
+    }
+
+    function userDecisionKindFromRow(row) {
+        const reviewKind = row.dataset.reviewKind || "";
+        if (reviewKind === "approved") return "approved";
+        // Treat duplicate as a reject decision for Approved/Rejected comparison.
+        if (reviewKind === "rejected" || reviewKind === "duplicate") return "rejected";
+        return ""; // skipped/pending/other are not used for agreement math
+    }
+
+    function buildAnalyticsData(panel) {
+        const tbody = panel.querySelector("tbody");
+        if (!tbody) return null;
+        const visibleRows = Array.from(tbody.querySelectorAll("tr")).filter(row => row.style.display !== "none");
+
+        const data = {
+            consideredRows: 0,
+            userTotal: 0,
+            solutionTotal: 0,
+            yourApproved: 0,
+            yourRejected: 0,
+            solutionApproved: 0,
+            solutionRejected: 0,
+            approveButRejected: 0,
+            rejectButApproved: 0,
+            agreement: 0,
+            disagreement: 0
+        };
+
+        for (const row of visibleRows) {
+            const solution = resolvedKindFromRow(row);
+            if (!solution) continue; // requested: exclude Reviewing review submissions
+            data.consideredRows++;
+            if (solution === "approved") data.solutionApproved++;
+            else data.solutionRejected++;
+
+            const userDecision = userDecisionKindFromRow(row);
+            if (!userDecision) continue;
+            data.userTotal++;
+            if (userDecision === "approved") data.yourApproved++;
+            else data.yourRejected++;
+
+            if (userDecision === solution) {
+                data.agreement++;
+            } else {
+                data.disagreement++;
+                if (userDecision === "approved" && solution === "rejected") data.approveButRejected++;
+                if (userDecision === "rejected" && solution === "approved") data.rejectButApproved++;
+            }
+        }
+
+        data.solutionTotal = data.solutionApproved + data.solutionRejected;
+        return data;
+    }
+
+    function updateAnalytics(panel) {
+        const box = panel.querySelector(".wfap-analytics");
+        if (!box) return;
+        const data = buildAnalyticsData(panel);
+        if (!data) {
+            box.textContent = "";
+            return;
+        }
+
+        const maxValue = Math.max(data.yourApproved, data.yourRejected, data.solutionApproved, data.solutionRejected, 1);
+        const barWidth = (value) => Math.max(2, Math.round((value / maxValue) * 100));
+
+        box.innerHTML = `
+            <h3>Resolved review comparison</h3>
+            <p class="wfap-analytics-note">Uses the current search/filter/sort view. Reviewing, not checked, skipped, and pending rows are excluded from agreement math.</p>
+            <div class="wfap-chart" aria-label="Your review versus review resolution bar chart">
+                <div class="wfap-chart-row">
+                    <div class="wfap-chart-label">Approved</div>
+                    <div class="wfap-chart-bars">
+                        <div class="wfap-chart-bar wfap-chart-user" style="width:${barWidth(data.yourApproved)}%"><span>Your review: ${data.yourApproved}</span></div>
+                        <div class="wfap-chart-bar wfap-chart-solution" style="width:${barWidth(data.solutionApproved)}%"><span>Review resolution: ${data.solutionApproved}</span></div>
+                    </div>
+                </div>
+                <div class="wfap-chart-row">
+                    <div class="wfap-chart-label">Rejected</div>
+                    <div class="wfap-chart-bars">
+                        <div class="wfap-chart-bar wfap-chart-user" style="width:${barWidth(data.yourRejected)}%"><span>Your review: ${data.yourRejected}</span></div>
+                        <div class="wfap-chart-bar wfap-chart-solution" style="width:${barWidth(data.solutionRejected)}%"><span>Review resolution: ${data.solutionRejected}</span></div>
+                    </div>
+                </div>
+            </div>
+            <div class="wfap-chart-legend">
+                <span><i class="wfap-legend-user"></i>Your review</span>
+                <span><i class="wfap-legend-solution"></i>Review resolution</span>
+            </div>
+            <div class="wfap-resolution-table-wrap">
+                <table class="wfap-resolution-table">
+                    <thead>
+                        <tr><th>Metric</th><th>Your review</th><th>Review resolution</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td>Approved</td><td>${data.yourApproved}</td><td>${data.solutionApproved}</td></tr>
+                        <tr><td>Rejected</td><td>${data.yourRejected}</td><td>${data.solutionRejected}</td></tr>
+                        <tr><td>Approved rate</td><td>${percent(data.yourApproved, data.userTotal)}</td><td>${percent(data.solutionApproved, data.solutionTotal)}</td></tr>
+                        <tr><td>Rejected rate</td><td>${percent(data.yourRejected, data.userTotal)}</td><td>${percent(data.solutionRejected, data.solutionTotal)}</td></tr>
+                        <tr><td>You approve but resolution reject</td><td>${data.approveButRejected}</td><td>—</td></tr>
+                        <tr><td>You reject but resolution approve</td><td>${data.rejectButApproved}</td><td>—</td></tr>
+                        <tr><td>Agreement rate</td><td>${percent(data.agreement, data.userTotal)}</td><td>—</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        `;
     }
 
     function statusRank(state, reverse = false) {
@@ -1008,11 +1406,71 @@
                 else if (result.state === "reviewing") reviewing++;
                 else rejected++;
 
-                summary.textContent = `Checked ${done}/${jobs.length} unchecked, skipped ${skippedApproved} already approved: ${approved} approved, ${reviewing} reviewing, ${rejected} likely rejected.`;
+                summary.textContent = `Checked ${done}/${jobs.length} unchecked, skipped ${skippedApproved} already approved: ${approved} approved, ${reviewing} reviewing, ${rejected} likely rejected. Exact-miss rows also checked same-name nearby within ${RELOCATION_RADIUS_M}m.`;
 
                 if (done >= jobs.length) {
                     btn.disabled = false;
                     if (reloadBtn) reloadBtn.disabled = false;
+                }
+            });
+        }
+    }
+
+    async function checkRejectedNearbyRows(panel) {
+        const rows = Array.from(panel.querySelectorAll("tbody tr"));
+        const records = panel._wfapRecords || [];
+        const btn = panel.querySelector(".wfap-check-relocated");
+        const checkBtn = panel.querySelector(".wfap-check-visible");
+        const reloadBtn = panel.querySelector(".wfap-refresh");
+        const summary = panel.querySelector(".wfap-summary");
+
+        if (!rows.length || !records.length) return;
+
+        const jobs = [];
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            const record = records[i];
+            if ((row.dataset.status || "") !== "likely-rejected") continue;
+            jobs.push({ row, record });
+        }
+
+        if (!jobs.length) {
+            summary.textContent = `No likely rejected rows loaded. Run Check unchecked first, or change the Status filter to Likely rejected.`;
+            return;
+        }
+
+        btn.disabled = true;
+        if (checkBtn) checkBtn.disabled = true;
+        if (reloadBtn) reloadBtn.disabled = true;
+
+        let done = 0;
+        let relocated = 0;
+        let stillRejected = 0;
+
+        for (const job of jobs) {
+            const { row, record } = job;
+            const statusCell = row.querySelector(".wfap-status");
+
+            statusCell.className = "wfap-status wfap-status-checking";
+            statusCell.textContent = "Queued nearby…";
+
+            enqueueCheck(async () => {
+                statusCell.textContent = `Checking same-name wayspots within ${RELOCATION_RADIUS_M}m…`;
+                const result = await checkRelocatedRecord(record, true);
+                setStatusCell(row, result);
+
+                done++;
+                if (result.state === "approved") relocated++;
+                else stillRejected++;
+
+                summary.textContent = `Nearby relocation check ${done}/${jobs.length}: ${relocated} same-name relocated approved, ${stillRejected} checked and still likely rejected.`;
+
+                if (done >= jobs.length) {
+                    btn.disabled = false;
+                    if (checkBtn) checkBtn.disabled = false;
+                    if (reloadBtn) reloadBtn.disabled = false;
+                    updateStats(panel);
+                    applyFiltersAndSort(panel);
                 }
             });
         }
@@ -1304,6 +1762,121 @@ body.dark #wf-review-approval-checker .wfap-controls select {
     margin: 8px 0;
     font-size: 12px;
     opacity: 0.9;
+}
+
+
+
+#wf-review-approval-checker .wfap-analytics {
+    margin-top: 14px;
+    padding: 12px;
+    border: 1px solid rgba(128,128,128,0.22);
+    border-radius: 8px;
+    background: rgba(128,128,128,0.06);
+}
+
+#wf-review-approval-checker .wfap-analytics h3 {
+    margin: 0 0 6px 0;
+    font-size: 16px;
+    font-weight: 700;
+}
+
+#wf-review-approval-checker .wfap-analytics-note {
+    margin: 0 0 10px 0;
+    font-size: 12px;
+    opacity: 0.85;
+}
+
+#wf-review-approval-checker .wfap-chart {
+    display: grid;
+    gap: 10px;
+    margin: 10px 0;
+}
+
+#wf-review-approval-checker .wfap-chart-row {
+    display: grid;
+    grid-template-columns: 90px 1fr;
+    gap: 10px;
+    align-items: center;
+}
+
+#wf-review-approval-checker .wfap-chart-label {
+    font-weight: 700;
+    font-size: 12px;
+}
+
+#wf-review-approval-checker .wfap-chart-bars {
+    display: grid;
+    gap: 4px;
+}
+
+#wf-review-approval-checker .wfap-chart-bar {
+    min-width: 2px;
+    border-radius: 5px;
+    padding: 4px 6px;
+    line-height: 1.15;
+    white-space: pre-line;
+    overflow: visible;
+    font-size: 11px;
+    box-sizing: border-box;
+}
+
+#wf-review-approval-checker .wfap-chart-user {
+    background: rgba(37, 99, 235, 0.26);
+    border: 1px solid rgba(37, 99, 235, 0.45);
+}
+
+#wf-review-approval-checker .wfap-chart-solution {
+    background: rgba(22, 163, 74, 0.26);
+    border: 1px solid rgba(22, 163, 74, 0.45);
+}
+
+#wf-review-approval-checker .wfap-chart-legend {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    margin: 6px 0 10px 0;
+    font-size: 12px;
+}
+
+#wf-review-approval-checker .wfap-chart-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
+#wf-review-approval-checker .wfap-chart-legend i {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    display: inline-block;
+}
+
+#wf-review-approval-checker .wfap-legend-user {
+    background: rgba(37, 99, 235, 0.40);
+    border: 1px solid rgba(37, 99, 235, 0.55);
+}
+
+#wf-review-approval-checker .wfap-legend-solution {
+    background: rgba(22, 163, 74, 0.40);
+    border: 1px solid rgba(22, 163, 74, 0.55);
+}
+
+#wf-review-approval-checker .wfap-resolution-table-wrap {
+    overflow-x: auto;
+}
+
+#wf-review-approval-checker .wfap-resolution-table {
+    width: 100%;
+    border-collapse: collapse;
+    min-width: 560px;
+    font-size: 12px;
+}
+
+#wf-review-approval-checker .wfap-resolution-table th,
+#wf-review-approval-checker .wfap-resolution-table td {
+    border-bottom: 1px solid rgba(128,128,128,0.22);
+    padding: 6px 8px;
+    text-align: left;
 }
 
 #wf-review-approval-checker .wfap-table-wrap {
