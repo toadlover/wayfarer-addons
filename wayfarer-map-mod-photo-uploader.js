@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Photo Upload
-// @namespace    https://wayfarer.nianticlabs.com/
-// @version      0.1.1
+// @namespace    https://github.com/Trungx5/wayfarer-addons/
+// @downloadURL  https://github.com/Trungx5/wayfarer-addons/blob/Trungx5/wayfarer-map-mod-photo-uploader.js
+// @homepageURL  https://github.com/Trungx5/wayfarer-addons/
+// @version      0.1.0
 // @description  Standalone simple draft photo uploader for Wayfarer Map Mod. Adds a plain panel link, previews/queues draft photos, retries failed uploads, and does not submit nominations.
 // @author       TrungLatias
 // @match        https://wayfarer.nianticlabs.com/*
