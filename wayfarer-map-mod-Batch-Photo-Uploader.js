@@ -3,7 +3,7 @@
 // @version      0.1.0
 // @description  Standalone simple draft photo uploader for Wayfarer Map Mod. Adds a plain panel link, previews/queues draft photos, retries failed uploads, and does not submit nominations.
 // @author       TrungLatias
-// @match        https://wayfarer.nianticlabs.com/
+// @match        https://wayfarer.nianticlabs.com/*
 // @run-at       document-idle
 // @grant        none
 // @require      https://cdn.jsdelivr.net/npm/heic-to@1.3.0/dist/iife/heic-to.js
