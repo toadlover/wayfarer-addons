@@ -1,10 +1,9 @@
 // ==UserScript==
-// @name         Wayfarer Map Draft Photo Upload Plugin
-// @namespace    https://chatgpt.local/wayfarer-map-photo-upload-plugin
+// @name         Wayfarer Map Draft Mass Photo Upload Plugin
 // @version      0.1.0
-// @description  Standalone simple draft photo uploader for Wayfarer Map Mod. Adds a plain panel link, uploads photos into drafts only, and does not submit nominations.
+// @description  Standalone simple draft photo uploader for Wayfarer Map Mod. Adds a plain panel link, previews/queues draft photos, retries failed uploads, and does not submit nominations.
 // @author       TrungLatias
-// @match        https://wayfarer.nianticlabs.com/*
+// @match        https://wayfarer.nianticlabs.com/
 // @run-at       document-idle
 // @grant        none
 // @require      https://cdn.jsdelivr.net/npm/heic-to@1.3.0/dist/iife/heic-to.js
@@ -15,6 +14,7 @@
 
   const MAX_PHOTOS = 6;
   const MAX_SUPPORTING = 5;
+  const MAX_UPLOAD_ATTEMPTS = 3;
   const LINK_TEXT = "Photo Upload";
   const state = { drafts: [], cards: new Map(), queue: [], running: false, userLoc: null };
 
@@ -233,9 +233,9 @@
     const style = document.createElement("style");
     style.id = "wfpu-plugin-css";
     style.textContent = `
-.wfpu-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:2147483599;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box}.wfpu-dialog{width:720px;max-width:calc(100vw - 24px);max-height:90vh;overflow:auto;background:#fff;color:#111827;border-radius:8px;box-shadow:0 10px 25px rgba(0,0,0,.35);font-family:Roboto,Arial,sans-serif;font-size:12px;padding:12px;box-sizing:border-box}.wfpu-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.wfpu-title{font-size:15px;font-weight:700}.wfpu-x{border:1px solid #d1d5db;background:#fff;border-radius:999px;width:26px;height:26px;cursor:pointer;font-weight:700}.wfpu-note{font-size:11px;color:#374151;margin-bottom:8px}.wfpu-toolbar,.wfpu-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:7px 0}.wfpu-btn{border:1px solid #d1d5db;border-radius:5px;background:#fff;color:#111827;cursor:pointer;font:inherit;padding:5px 9px}.wfpu-btn:hover:not(:disabled){background:#f3f4f6}.wfpu-btn:disabled{opacity:.55;cursor:not-allowed}.wfpu-primary{background:#fb4c21;border-color:#fb4c21;color:#fff}.wfpu-primary:hover:not(:disabled){background:#e0441d}.wfpu-search{flex:1 1 180px;min-width:0;border:1px solid #d1d5db;border-radius:5px;font:inherit;padding:6px 8px}.wfpu-status,.wfpu-meta,.wfpu-empty{font-size:11px;color:#6b7280}.wfpu-status.ok{color:#047857}.wfpu-status.err{color:#b91c1c}.wfpu-list{display:flex;flex-direction:column;gap:8px;max-height:48vh;overflow-y:auto;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;padding:6px}.wfpu-card{border:1px solid #e5e7eb;border-radius:6px;background:#fff;padding:8px}.wfpu-card-title{font-weight:700;word-break:break-word}.wfpu-files{display:flex;flex-direction:column;gap:4px;margin-top:6px}.wfpu-file{display:grid;grid-template-columns:76px minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #e5e7eb;border-radius:5px;background:#f9fafb;padding:5px}.wfpu-role{font-weight:700;font-size:11px}.wfpu-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wfpu-queue{border-top:1px solid #e5e7eb;margin-top:10px;padding-top:8px}.wfpu-qrow{border:1px solid #e5e7eb;border-radius:5px;margin:5px 0;padding:6px}.wfpu-bar{height:6px;border-radius:999px;background:#e5e7eb;overflow:hidden;margin-top:4px}.wfpu-fill{height:100%;width:0%;background:#fb4c21;transition:width 160ms ease}
-@media(max-width:620px){.wfpu-dialog{width:calc(100vw - 16px);max-height:94vh}.wfpu-toolbar,.wfpu-actions{align-items:stretch}.wfpu-toolbar .wfpu-btn,.wfpu-search{flex:1 1 100%}.wfpu-file{grid-template-columns:68px minmax(0,1fr)}.wfpu-file .wfpu-btn{grid-column:1/-1}}
-@media(prefers-color-scheme:dark){.wfpu-dialog,.wfpu-card{background:#111827;color:#f9fafb}.wfpu-x,.wfpu-btn,.wfpu-search{background:#1f2937;color:#f9fafb;border-color:rgba(255,255,255,.18)}.wfpu-list,.wfpu-file{background:#0f172a;border-color:rgba(255,255,255,.14)}.wfpu-card,.wfpu-qrow{border-color:rgba(255,255,255,.14)}.wfpu-note,.wfpu-status,.wfpu-meta,.wfpu-empty{color:#9ca3af}.wfpu-primary{background:#fb4c21;border-color:#fb4c21}.wfpu-bar{background:#374151}}
+.wfpu-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:2147483599;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box}.wfpu-dialog{width:720px;max-width:calc(100vw - 24px);max-height:90vh;overflow:auto;background:#fff;color:#111827;border-radius:8px;box-shadow:0 10px 25px rgba(0,0,0,.35);font-family:Roboto,Arial,sans-serif;font-size:12px;padding:12px;box-sizing:border-box}.wfpu-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}.wfpu-title{font-size:15px;font-weight:700}.wfpu-x{border:1px solid #d1d5db;background:#fff;border-radius:999px;width:26px;height:26px;cursor:pointer;font-weight:700}.wfpu-note{font-size:11px;color:#374151;margin-bottom:8px}.wfpu-toolbar,.wfpu-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:7px 0}.wfpu-btn{border:1px solid #d1d5db;border-radius:5px;background:#fff;color:#111827;cursor:pointer;font:inherit;padding:5px 9px}.wfpu-btn:hover:not(:disabled){background:#f3f4f6}.wfpu-btn:disabled{opacity:.55;cursor:not-allowed}.wfpu-primary{background:#fb4c21;border-color:#fb4c21;color:#fff}.wfpu-primary:hover:not(:disabled){background:#e0441d}.wfpu-search{flex:1 1 180px;min-width:0;border:1px solid #d1d5db;border-radius:5px;font:inherit;padding:6px 8px}.wfpu-status,.wfpu-meta,.wfpu-empty{font-size:11px;color:#6b7280}.wfpu-status.ok{color:#047857}.wfpu-status.err{color:#b91c1c}.wfpu-list{display:flex;flex-direction:column;gap:8px;max-height:48vh;overflow-y:auto;border:1px solid #e5e7eb;border-radius:6px;background:#f9fafb;padding:6px}.wfpu-card{border:1px solid #e5e7eb;border-radius:6px;background:#fff;padding:8px}.wfpu-card-title{font-weight:700;word-break:break-word}.wfpu-files{display:flex;flex-direction:column;gap:4px;margin-top:6px}.wfpu-file{display:grid;grid-template-columns:54px 76px minmax(0,1fr) auto;gap:6px;align-items:center;border:1px solid #e5e7eb;border-radius:5px;background:#f9fafb;padding:5px}.wfpu-thumb{width:54px;height:54px;border-radius:4px;object-fit:cover;background:#e5e7eb;border:1px solid #e5e7eb}.wfpu-role{font-weight:700;font-size:11px}.wfpu-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.wfpu-queue{border-top:1px solid #e5e7eb;margin-top:10px;padding-top:8px}.wfpu-qrow{border:1px solid #e5e7eb;border-radius:5px;margin:5px 0;padding:6px}.wfpu-qhead{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:6px;align-items:center}.wfpu-qx{border:1px solid #d1d5db;background:#fff;color:#111827;border-radius:4px;width:20px;height:20px;line-height:16px;padding:0;cursor:pointer;font-size:12px;font-weight:700}.wfpu-qx:disabled{opacity:.45;cursor:not-allowed}.wfpu-bar{height:6px;border-radius:999px;background:#e5e7eb;overflow:hidden;margin-top:4px}.wfpu-fill{height:100%;width:0%;background:#fb4c21;transition:width 160ms ease}
+@media(max-width:620px){.wfpu-dialog{width:calc(100vw - 16px);max-height:94vh}.wfpu-toolbar,.wfpu-actions{align-items:stretch}.wfpu-toolbar .wfpu-btn,.wfpu-search{flex:1 1 100%}.wfpu-file{grid-template-columns:54px 68px minmax(0,1fr)}.wfpu-file .wfpu-btn{grid-column:1/-1}}
+@media(prefers-color-scheme:dark){.wfpu-dialog,.wfpu-card{background:#111827;color:#f9fafb}.wfpu-x,.wfpu-btn,.wfpu-search,.wfpu-qx{background:#1f2937;color:#f9fafb;border-color:rgba(255,255,255,.18)}.wfpu-list,.wfpu-file,.wfpu-thumb{background:#0f172a;border-color:rgba(255,255,255,.14)}.wfpu-card,.wfpu-qrow{border-color:rgba(255,255,255,.14)}.wfpu-note,.wfpu-status,.wfpu-meta,.wfpu-empty{color:#9ca3af}.wfpu-primary{background:#fb4c21;border-color:#fb4c21}.wfpu-bar{background:#374151}}
 `;
     document.head.appendChild(style);
   }
@@ -259,12 +259,17 @@
     card.photos.forEach((photo, i) => {
       const row = document.createElement("div");
       row.className = "wfpu-file";
+      const thumb = document.createElement("img");
+      thumb.className = "wfpu-thumb";
+      thumb.alt = photoRole(i) + " preview";
+      thumb.src = photo.dataUrl || "";
       const role = document.createElement("div");
       role.className = "wfpu-role";
       role.textContent = photoRole(i);
       const name = document.createElement("div");
       name.className = "wfpu-name";
-      name.textContent = photo.name + (i >= MAX_PHOTOS ? " (not uploaded)" : "");
+      name.title = photo.name || "photo";
+      name.textContent = photo.name + (i >= MAX_PHOTOS ? " (ignored, not uploaded)" : "");
       const del = document.createElement("button");
       del.type = "button";
       del.className = "wfpu-btn";
@@ -274,7 +279,7 @@
         if (removed) card.undoStack.push({ index: i, photo: removed });
         renderSelected(card);
       });
-      row.append(role, name, del);
+      row.append(thumb, role, name, del);
       el.appendChild(row);
     });
   }
@@ -284,10 +289,16 @@
     entry.progress = Math.max(0, Math.min(100, Number(pct) || 0));
     if (entry.statusEl) entry.statusEl.textContent = entry.status;
     if (entry.fillEl) entry.fillEl.style.width = entry.progress + "%";
+    if (entry.cancelBtn) entry.cancelBtn.disabled = !!entry.done || !!entry.cancelled;
+  }
+
+  function throwIfCancelled(entry) {
+    if (entry.cancelled) throw new Error("Cancelled");
   }
 
   async function uploadEntry(entry) {
     const card = entry.card;
+    throwIfCancelled(entry);
     const draft = card.draft;
     const photos = card.photos.slice(0, MAX_PHOTOS);
     if (!photos.length) throw new Error("No photos selected.");
@@ -297,14 +308,17 @@
     const slots = photos.map((_, i) => slotName(i));
     setQueueStatus(entry, "Requesting upload URLs", 15);
     const urlMap = await requestUploadUrls(draft.id, slots);
+    throwIfCancelled(entry);
     const gcs = {};
     for (let i = 0; i < photos.length; i++) {
       const slot = slots[i];
       const info = urlMap[slot] || {};
       const uploadUrl = info.uploadUrl || info.url || info.signedUrl;
       if (!uploadUrl || !info.gcsPath) throw new Error("Missing upload URL for " + slot);
+      throwIfCancelled(entry);
       setQueueStatus(entry, "Uploading " + (i + 1) + "/" + photos.length, 20 + Math.floor((i / photos.length) * 60));
       await putSigned(uploadUrl, photos[i].blob);
+      throwIfCancelled(entry);
       gcs[slot] = info.gcsPath;
     }
     const supporting = [];
@@ -313,7 +327,9 @@
       if (gcs[slot]) supporting.push(gcs[slot]);
     }
     setQueueStatus(entry, "Saving draft", 88);
+    throwIfCancelled(entry);
     const saved = await saveDraft(draft, { mainImageGcsPath: gcs.main || null, supportingImageGcsPaths: supporting, supportingImageServingUrls: [] });
+    throwIfCancelled(entry);
     card.draft = saved;
     const idx = state.drafts.findIndex(d => d.id === saved.id);
     if (idx >= 0) state.drafts[idx] = saved;
@@ -334,7 +350,7 @@
   function addQueue(card, autoStart) {
     if (!card.photos.length) return setCardStatus(card, "Choose photos first", "err");
     const existing = state.queue.find(e => e.card === card && !e.done);
-    if (!existing) state.queue.push({ card, title: card.draft.title, status: "Waiting", progress: 0, done: false });
+    if (!existing) state.queue.push({ card, title: card.draft.title, status: "Waiting", progress: 0, done: false, attempts: 0, cancelled: false });
     setCardStatus(card, "Queued");
     renderQueue();
     if (autoStart) runQueue();
@@ -354,9 +370,28 @@
     state.queue.forEach(entry => {
       const row = document.createElement("div");
       row.className = "wfpu-qrow";
+      const head = document.createElement("div");
+      head.className = "wfpu-qhead";
       const title = document.createElement("div");
       title.className = "wfpu-card-title";
       title.textContent = entry.title;
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "wfpu-qx";
+      cancel.textContent = "×";
+      cancel.title = "Cancel this submission";
+      cancel.disabled = !!entry.done || !!entry.cancelled;
+      cancel.addEventListener("click", () => {
+        entry.cancelled = true;
+        if (!state.running || entry.status === "Waiting") {
+          state.queue = state.queue.filter(e => e !== entry);
+          renderQueue();
+        } else {
+          setQueueStatus(entry, "Cancelling…", entry.progress || 0);
+        }
+        setCardStatus(entry.card, "Cancelled", "err");
+      });
+      head.append(title, cancel);
       const status = document.createElement("div");
       status.className = "wfpu-status";
       status.textContent = entry.status;
@@ -366,10 +401,11 @@
       fill.className = "wfpu-fill";
       fill.style.width = (entry.progress || 0) + "%";
       bar.appendChild(fill);
-      row.append(title, status, bar);
+      row.append(head, status, bar);
       list.appendChild(row);
       entry.statusEl = status;
       entry.fillEl = fill;
+      entry.cancelBtn = cancel;
     });
   }
 
@@ -378,16 +414,32 @@
     state.running = true;
     try {
       for (const entry of state.queue) {
-        if (entry.done) continue;
-        try {
-          setCardStatus(entry.card, "Uploading…");
-          setQueueStatus(entry, "Starting", 5);
-          await uploadEntry(entry);
-          entry.done = true;
-        } catch (err) {
-          console.error("[WF Photo Upload]", err);
-          setQueueStatus(entry, "Error: " + err.message, entry.progress || 0);
-          setCardStatus(entry.card, "Error: " + err.message, "err");
+        if (entry.done || entry.cancelled) continue;
+        while (!entry.done && !entry.cancelled && entry.attempts < MAX_UPLOAD_ATTEMPTS) {
+          try {
+            entry.attempts++;
+            setCardStatus(entry.card, entry.attempts > 1 ? "Retrying upload…" : "Uploading…");
+            setQueueStatus(entry, entry.attempts > 1 ? "Retrying " + entry.attempts + "/" + MAX_UPLOAD_ATTEMPTS : "Starting", 5);
+            await uploadEntry(entry);
+            entry.done = true;
+          } catch (err) {
+            console.error("[WF Photo Upload]", err);
+            if (entry.cancelled || err.message === "Cancelled") {
+              entry.cancelled = true;
+              setQueueStatus(entry, "Cancelled", entry.progress || 0);
+              setCardStatus(entry.card, "Cancelled", "err");
+              break;
+            }
+            if (entry.attempts < MAX_UPLOAD_ATTEMPTS) {
+              setQueueStatus(entry, "Failed, will retry by default", entry.progress || 0);
+              setCardStatus(entry.card, "Failed, will retry by default", "err");
+              await new Promise(resolve => setTimeout(resolve, 900));
+              continue;
+            }
+            setQueueStatus(entry, "Error after " + entry.attempts + " tries: " + err.message, entry.progress || 0);
+            setCardStatus(entry.card, "Error after " + entry.attempts + " tries: " + err.message, "err");
+            break;
+          }
         }
       }
     } finally {
@@ -531,7 +583,7 @@
 
     const note = document.createElement("div");
     note.className = "wfpu-note";
-    note.textContent = "Photo 1 = main. Photos 2–6 = supporting. Extra photos are listed but ignored. This saves drafts only, not nominations.";
+    note.textContent = "Select multiple photo result in first photo = Main, Photos 2-6 = supporting. Extra photo are ignored and won't upload. You should double check and queue all your submission by using \"Add Queue\" then press \"Start queue\" to submit all photo. Failed upload will resubmit by default.";
     dialog.appendChild(note);
 
     const toolbar = document.createElement("div");
