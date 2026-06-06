@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         Wayfarer Map Mods - Photo Upload
-// @namespace    https://github.com/Trungx5/wayfarer-addons/
-// @downloadURL  https://github.com/Trungx5/wayfarer-addons/blob/Trungx5/wayfarer-map-mod-photo-uploader.js
-// @homepageURL  https://github.com/Trungx5/wayfarer-addons/
-// @version      0.1.0
-// @description  Standalone simple draft photo uploader for Wayfarer Map Mod. Adds a plain panel link, previews/queues draft photos, retries failed uploads, and does not submit nominations.
+// @namespace    https://wayfarer.nianticlabs.com/
+// @version      0.1.1
+// @description  Draft photo uploader for Wayfarer Map Mod.
 // @author       TrungLatias
 // @match        https://wayfarer.nianticlabs.com/*
 // @run-at       document-idle
 // @grant        none
 // @require      https://cdn.jsdelivr.net/npm/heic-to@1.3.0/dist/iife/heic-to.js
+// @updateURL    https://raw.githubusercontent.com/Trungx5/wayfarer-addons/Trungx5/wayfarer-map-mod-photo-uploader.user.js
+// @downloadURL  https://raw.githubusercontent.com/Trungx5/wayfarer-addons/Trungx5/wayfarer-map-mod-photo-uploader.user.js
 // ==/UserScript==
 
 (function () {
