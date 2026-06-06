@@ -1,9 +1,7 @@
 // ==UserScript==
 // @name         Wayfarer Map Compact Pre-texts Plugin
-// @namespace    https://chatgpt.local/wayfarer-map-pretexts-compact
 // @version      0.1.0
 // @description  Standalone compact pre-text manager for Wayfarer Map Mod. Adds a simple panel link and a small submit-screen pre-text box without editing the base script.
-// @author       TrungLatias
 // @match        https://wayfarer.nianticlabs.com/*
 // @run-at       document-idle
 // @grant        none
