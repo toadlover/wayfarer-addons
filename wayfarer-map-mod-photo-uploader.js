@@ -1,6 +1,7 @@
 // ==UserScript==
-// @name         Wayfarer Map Mods - Batch Photo Uploader for Draft
-// @version      0.1.0
+// @name         Wayfarer Map Mods - Photo Upload
+// @namespace    https://wayfarer.nianticlabs.com/
+// @version      0.1.1
 // @description  Standalone simple draft photo uploader for Wayfarer Map Mod. Adds a plain panel link, previews/queues draft photos, retries failed uploads, and does not submit nominations.
 // @author       TrungLatias
 // @match        https://wayfarer.nianticlabs.com/*
