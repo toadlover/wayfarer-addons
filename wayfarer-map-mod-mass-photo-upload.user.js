@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Wayfarer Map Draft Mass Photo Upload Plugin
+// @name         Wayfarer Map Mods - Batch Photo Uploader for Draft
 // @version      0.1.0
 // @description  Standalone simple draft photo uploader for Wayfarer Map Mod. Adds a plain panel link, previews/queues draft photos, retries failed uploads, and does not submit nominations.
 // @author       TrungLatias
