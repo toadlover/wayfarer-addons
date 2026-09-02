@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.18
+// @version     0.3
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
 // @homepageURL https://github.com/toadlover/wayfarer-addons/
+// @match       https://wayfarer.scopely.com/*
 // @match       https://wayfarer.nianticlabs.com/*
 // ==/UserScript==
 
@@ -12,6 +13,7 @@
 // This file is part of the Wayfarer Addons collection.
 // This file is made as a modification of the wayfarer-nomination-stats.user.js script to display figure-like plots in the web page to summarize nomination stats over time or by submission area.
 // File made by user NonEMusDingo
+// User experience substantially improved by TrungLatias
 
 // This script is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -75,18 +77,227 @@ function init() {
       EDIT_LOCATION: "Edit Location"
     };
 
+    const TYPE_TITLE_DISPLAY = {
+      NOMINATION: "Nominations",
+      PHOTO: "Photos",
+      EDIT_TITLE: "Title",
+      EDIT_DESCRIPTION: "Description",
+      EDIT_LOCATION: "Location"
+    };
+
+    const CHART_SCOPE_ALL_SELECTED = "__ALL_SELECTED_TYPES__";
+
     const plotState = {
       selectedStatuses: new Set(["ACCEPTED"]),
       selectedTypes: new Set(["NOMINATION"]),
+      visibleChartScopes: null,
+      _chartScopeOptionKeys: null,
       aggregationMode: "cityState", // or "state"
       maxBars: 20, // default number of bars to display in plot
       timelineAreaFilter: "__ALL__",
       timelineMode: "cumulative", // or "monthly"
       showDataLabels: false, // toggle data labels on graphs
-      showAllSubmissions: false // overlay total submissions line regardless of status filter
+      showAllSubmissions: false, // overlay total submissions line regardless of status filter
+      showAllSubmissionsArea: false, // show blank remainder bar in area chart
+      timelineViewMode: "responsive", // "responsive" = fit to width | "scrollable" = fixed 3-letter months
+      timelineRangeEnabled: false, // toggle date-range filter on/off
+      timelineRangeStart: "",      // "YYYY-MM-DD"
+      timelineRangeEnd: "",        // "YYYY-MM-DD"
+      areaRangeEnabled: false,     // date-range filter for area chart only
+      areaRangeStart: "",          // "YYYY-MM-DD"
+      areaRangeEnd: "",            // "YYYY-MM-DD"
+      typeStatusRangeEnabled: false, // date-range filter applied to BOTH charts (by type/status)
+      typeStatusRangeStart: "",      // "YYYY-MM-DD"
+      typeStatusRangeEnd: "",        // "YYYY-MM-DD"
+      timelineAreaProvinceOnly: false // filter Timeline Area dropdown to province/state level
     };
 
-    //setup to be able to export plots as png
+    // ─── OSM Reverse-Geocoding Cache & Queue ──────────────────────────────────
+    const OSM_CACHE_KEY = "wfns_osm_geocache_v1";
+    let osmQueue        = [];
+    let osmQueueBusy    = false;
+    let osmPendingCount = 0;
+    let osmDoneCount    = 0;
+
+    function osmCacheGet(lat, lng) {
+      try {
+        const raw   = localStorage.getItem(OSM_CACHE_KEY);
+        const store = raw ? JSON.parse(raw) : {};
+        // Round to 5 dp so tiny float drift doesn't create duplicate keys
+        return store[`${(+lat).toFixed(5)},${(+lng).toFixed(5)}`] || null;
+      } catch (_) { return null; }
+    }
+
+    function osmCacheSet(lat, lng, value) {
+      try {
+        const raw   = localStorage.getItem(OSM_CACHE_KEY);
+        const store = raw ? JSON.parse(raw) : {};
+        store[`${(+lat).toFixed(5)},${(+lng).toFixed(5)}`] = value;
+        localStorage.setItem(OSM_CACHE_KEY, JSON.stringify(store));
+      } catch (_) {}
+    }
+
+    function osmCacheSize() {
+      try {
+        const raw = localStorage.getItem(OSM_CACHE_KEY);
+        return raw ? Object.keys(JSON.parse(raw)).length : 0;
+      } catch (_) { return 0; }
+    }
+
+    // Resolves to "State, CC" or falls back to "Unknown"
+    function osmReverseGeocode(lat, lng) {
+      return new Promise(resolve => {
+        osmQueue.push({ lat, lng, resolve });
+        if (!osmQueueBusy) osmDrainQueue();
+      });
+    }
+
+    function osmDrainQueue() {
+      if (!osmQueue.length) { osmQueueBusy = false; return; }
+      osmQueueBusy = true;
+      const { lat, lng, resolve } = osmQueue.shift();
+
+      // zoom=14 → enough detail to return suburb/neighbourhood/town + city/county/state + country
+      const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=14&addressdetails=1`;
+      fetch(url, { headers: { "Accept-Language": "en" } })
+        .then(r => r.json())
+        .then(data => {
+          const addr = data.address || {};
+
+          // =========================
+          // Town: smallest named locality
+          // =========================
+          const town =
+            addr.suburb ||
+            addr.neighbourhood ||
+            addr.quarter ||
+            addr.city_district ||
+            addr.village ||
+            addr.hamlet ||
+            addr.town ||
+            "";
+
+          // =========================
+          // Mid: biggest named city/district area (skip if same as town)
+          // =========================
+          const midRaw =
+            addr.city ||
+            addr.municipality ||
+            addr.county ||
+            addr.district ||
+            addr.state_district ||
+            addr.state ||
+            addr.province ||
+            addr.region ||
+            "";
+          const mid = midRaw !== town ? midRaw : "";
+
+          // =========================
+          // Country
+          // =========================
+          const country =
+            addr.country ||
+            (addr.country_code ? addr.country_code.toUpperCase() : "");
+
+          // =========================
+          // Final formatted label: Town, Mid, Country
+          // e.g. "Linh Trung, Thu Duc, Vietnam"
+          // =========================
+          const label = [town, mid, country]
+            .filter(Boolean)
+            .join(", ") || "Unknown";
+
+          osmCacheSet(lat, lng, label);
+          resolve(label);
+        })
+        .catch(() => {
+          // On network error, resolve with Unknown so the queue keeps moving
+          resolve("Unknown");
+        })
+        .finally(() => {
+          // Drain next item after 1 s (Nominatim rate limit)
+          setTimeout(osmDrainQueue, 1000);
+        });
+    }
+
+    // Geocode every nomination that has coords and isn't already cached.
+    // DOM progress bar is updated if present; re-renders when finished.
+    function osmStartPrewarm(nominations) {
+      const uncached = nominations.filter(n =>
+        n && n.lat != null && n.lng != null && !osmCacheGet(n.lat, n.lng)
+      );
+
+      // Deduplicate by rounded key so we don't fire multiple requests for same spot
+      const seen   = new Set();
+      const unique = uncached.filter(n => {
+        const k = `${(+n.lat).toFixed(5)},${(+n.lng).toFixed(5)}`;
+        if (seen.has(k)) return false;
+        seen.add(k); return true;
+      });
+
+      if (!unique.length) return;
+
+      osmPendingCount = unique.length;
+      osmDoneCount    = 0;
+      osmUpdateProgressBar();
+
+      unique.forEach(n => {
+        osmReverseGeocode(n.lat, n.lng).then(() => {
+          osmDoneCount++;
+          osmUpdateProgressBar();
+          if (osmDoneCount >= osmPendingCount) {
+            osmHideProgressBar();
+            // Update cache-count label in controls if visible
+            const lbl = document.getElementById("wfns-osm-cache-count");
+            if (lbl) lbl.textContent = `${osmCacheSize()} coords cached`;
+            // Re-render if OSM mode is currently selected
+            if (plotState.aggregationMode === "osm") renderPlots();
+          }
+        });
+      });
+    }
+
+    function osmUpdateProgressBar() {
+      let bar = document.getElementById("wfns-osm-bar");
+      if (!bar) {
+        // Create a fixed toast-style bar anchored to top of the plots root
+        const root = document.getElementById("wfns-plots-inner");
+        if (!root) return;
+        bar = document.createElement("div");
+        bar.id = "wfns-osm-bar";
+        bar.style.cssText = `
+          display:flex; align-items:center; gap:10px; padding:7px 12px;
+          background:var(--wfns-bg-card,#fff); border:1px solid var(--wfns-ctrl-border,#DF471C);
+          border-radius:6px; margin-bottom:8px; font-size:12px;
+          color:var(--wfns-text,#000);
+        `;
+        bar.innerHTML = `
+          <span id="wfns-osm-spin" style="
+            display:inline-block;width:14px;height:14px;border-radius:50%;
+            border:2px solid var(--wfns-ctrl-border,#DF471C);
+            border-top-color:transparent;
+            animation:wfns-spin 0.8s linear infinite;flex-shrink:0;"></span>
+          <span id="wfns-osm-bar-lbl"></span>
+          <span style="font-size:10px;opacity:0.65;">(1 request/s — cached permanently)</span>
+        `;
+        root.insertBefore(bar, root.firstChild);
+        // Inject keyframe once
+        if (!document.getElementById("wfns-spin-kf")) {
+          const s = document.createElement("style");
+          s.id = "wfns-spin-kf";
+          s.textContent = "@keyframes wfns-spin{to{transform:rotate(360deg)}}";
+          document.head.appendChild(s);
+        }
+      }
+      const lbl = document.getElementById("wfns-osm-bar-lbl");
+      if (lbl) lbl.textContent = `OSM geocoding: ${osmDoneCount} / ${osmPendingCount}`;
+    }
+
+    function osmHideProgressBar() {
+      const bar = document.getElementById("wfns-osm-bar");
+      if (bar) bar.remove();
+    }
+    // ─────────────────────────────────────────────────────────────────────────
     function loadHtml2Canvas() {
       return new Promise((resolve, reject) => {
         if (window.html2canvas) {
@@ -102,24 +313,38 @@ function init() {
       });
     }
 
-    async function exportAreaPlotAsPng() {
+    function getExportCard(target, rootId, wrapSelector) {
+      let card = target && target.closest ? target.closest(".wfns-chart-card") : null;
+      if (!card && target && target.querySelector) card = target;
+
+      const root = document.getElementById(rootId);
+      if ((!card || !card.querySelector(wrapSelector)) && root) {
+        card = root.querySelector(".wfns-chart-card");
+      }
+
+      const wrap = card && card.querySelector ? card.querySelector(wrapSelector) : null;
+      return { card, wrap };
+    }
+
+    async function exportAreaPlotAsPng(target, chartScope) {
       await loadHtml2Canvas();
 
-      const chart = document.getElementById("wfns-plot-chart");
-      const barsWrap = document.getElementById("wfns-bars-wrap");
+      const { card, wrap: barsWrap } = getExportCard(target, "wfns-plot-chart", ".wfns-bars-wrap");
 
-      if (!chart || !barsWrap) {
+      if (!card || !barsWrap) {
         console.log("Plot export failed: chart or barsWrap not found.");
         return;
       }
 
       const original = {
-        chartWidth: chart.style.width,
-        chartOverflow: chart.style.overflow,
+        chartWidth: card.style.width,
+        chartOverflow: card.style.overflow,
         barsWrapWidth: barsWrap.style.width,
         barsWrapOverflow: barsWrap.style.overflow,
         barsWrapOverflowX: barsWrap.style.overflowX,
       };
+      const exportButtons = Array.from(card.querySelectorAll(".wfns-chart-export-button"));
+      const buttonVisibility = exportButtons.map(button => button.style.visibility);
 
       try {
         const fullWidth = Math.max(barsWrap.scrollWidth, barsWrap.clientWidth);
@@ -128,10 +353,11 @@ function init() {
         barsWrap.style.overflow = "visible";
         barsWrap.style.overflowX = "visible";
 
-        chart.style.width = `${fullWidth + 40}px`;
-        chart.style.overflow = "visible";
+        card.style.width = `${fullWidth + 40}px`;
+        card.style.overflow = "visible";
+        exportButtons.forEach(button => { button.style.visibility = "hidden"; });
 
-        const canvas = await html2canvas(chart, {
+        const canvas = await html2canvas(card, {
           backgroundColor: "#ffffff",
           scale: 2,
           useCORS: true
@@ -141,42 +367,43 @@ function init() {
         const mode = plotState.aggregationMode === "state" ? "state" : "citystate";
         const date = new Date().toISOString().slice(0, 10);
 
-        const types = Array.from(plotState.selectedTypes).join("-");
+        const scopePart = getChartScopeFilenamePart(chartScope);
         const statuses = Array.from(plotState.selectedStatuses).join("-");
 
-        //link.download = `wayfarer_plot_${mode}_${date}.png`;
-        link.download = `wayfarer_${mode}_${types}_${statuses}_${date}.png`;
+        link.download = `wayfarer_area_${mode}_${scopePart}_${statuses}_${date}.png`;
         link.href = canvas.toDataURL("image/png");
         link.click();
       } catch (err) {
         console.log("Plot export failed:", err);
       } finally {
-        chart.style.width = original.chartWidth;
-        chart.style.overflow = original.chartOverflow;
+        card.style.width = original.chartWidth;
+        card.style.overflow = original.chartOverflow;
         barsWrap.style.width = original.barsWrapWidth;
         barsWrap.style.overflow = original.barsWrapOverflow;
         barsWrap.style.overflowX = original.barsWrapOverflowX;
+        exportButtons.forEach((button, idx) => { button.style.visibility = buttonVisibility[idx]; });
       }
     }
 
-    async function exportTimelinePlotAsPng() {
+    async function exportTimelinePlotAsPng(target, chartScope) {
       await loadHtml2Canvas();
 
-      const chart = document.getElementById("wfns-timeline-chart");
-      const timelineWrap = document.getElementById("wfns-timeline-wrap");
+      const { card, wrap: timelineWrap } = getExportCard(target, "wfns-timeline-chart", ".wfns-timeline-wrap");
 
-      if (!chart || !timelineWrap) {
+      if (!card || !timelineWrap) {
         console.log("Timeline export failed: chart or timelineWrap not found.");
         return;
       }
 
       const original = {
-        chartWidth: chart.style.width,
-        chartOverflow: chart.style.overflow,
+        chartWidth: card.style.width,
+        chartOverflow: card.style.overflow,
         wrapWidth: timelineWrap.style.width,
         wrapOverflow: timelineWrap.style.overflow,
         wrapOverflowX: timelineWrap.style.overflowX,
       };
+      const exportButtons = Array.from(card.querySelectorAll(".wfns-chart-export-button"));
+      const buttonVisibility = exportButtons.map(button => button.style.visibility);
 
       try {
         const fullWidth = Math.max(timelineWrap.scrollWidth, timelineWrap.clientWidth);
@@ -185,10 +412,11 @@ function init() {
         timelineWrap.style.overflow = "visible";
         timelineWrap.style.overflowX = "visible";
 
-        chart.style.width = `${fullWidth + 40}px`;
-        chart.style.overflow = "visible";
+        card.style.width = `${fullWidth + 40}px`;
+        card.style.overflow = "visible";
+        exportButtons.forEach(button => { button.style.visibility = "hidden"; });
 
-        const canvas = await html2canvas(chart, {
+        const canvas = await html2canvas(card, {
           backgroundColor: "#ffffff",
           scale: 2,
           useCORS: true
@@ -200,71 +428,171 @@ function init() {
           plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
             ? plotState.timelineAreaFilter.replace(/[^a-zA-Z0-9_-]+/g, "_")
             : "allareas";
+        const scopePart = getChartScopeFilenamePart(chartScope);
         const date = new Date().toISOString().slice(0, 10);
 
-        link.download = `wayfarer_timeline_${mode}_${areaPart}_${date}.png`;
+        link.download = `wayfarer_timeline_${mode}_${areaPart}_${scopePart}_${date}.png`;
         link.href = canvas.toDataURL("image/png");
         link.click();
       } catch (err) {
         console.log("Timeline export failed:", err);
       } finally {
-        chart.style.width = original.chartWidth;
-        chart.style.overflow = original.chartOverflow;
+        card.style.width = original.chartWidth;
+        card.style.overflow = original.chartOverflow;
         timelineWrap.style.width = original.wrapWidth;
         timelineWrap.style.overflow = original.wrapOverflow;
         timelineWrap.style.overflowX = original.wrapOverflowX;
+        exportButtons.forEach((button, idx) => { button.style.visibility = buttonVisibility[idx]; });
       }
     }
 
     /**
-     * Overwrite the open method of the XMLHttpRequest.prototype to intercept the server calls
+     * Wayfarer moved from wayfarer.nianticlabs.com to wayfarer.scopely.com and the
+     * Angular app now issues the manage call through both XHR and fetch, sometimes
+     * with an absolute URL and/or a query string. Normalise before matching so the
+     * plots keep working on the new site.
      */
+    const MANAGE_PATH = '/api/v1/vault/manage';
+
+    function isManageListUrl(url) {
+        try {
+            const path = new URL(String(url), window.location.origin).pathname.replace(/\/+$/, '');
+            return path === MANAGE_PATH;
+        } catch (e) {
+            return String(url).split('?')[0].replace(/\/+$/, '') === MANAGE_PATH;
+        }
+    }
+
     (function (open) {
         XMLHttpRequest.prototype.open = function (method, url) {
-            if (url == '/api/v1/vault/manage') {
-                if (method == 'GET') {
-                    this.addEventListener('load', parseNominations, false);
-                }
+            if (String(method).toUpperCase() === 'GET' && isManageListUrl(url)) {
+                this.addEventListener('load', parseNominations, false);
             }
-            open.apply(this, arguments);
+            return open.apply(this, arguments);
         };
     })(XMLHttpRequest.prototype.open);
 
-    function parseNominations(e) {
+    (function (nativeFetch) {
+        if (typeof nativeFetch !== 'function') return;
+        window.fetch = function (input, options) {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            const method = String((options && options.method) || (input && input.method) || 'GET').toUpperCase();
+            const result = nativeFetch.apply(this, arguments);
+            if (method !== 'GET' || !isManageListUrl(url)) return result;
+            return result.then(response => {
+                response.clone().json()
+                    .then(json => ingestManageJson(json))
+                    .catch(() => {});
+                return response;
+            });
+        };
+    })(window.fetch);
+
+    function ingestManageJson(json) {
+        if (!json || json.captcha) return false;
+        const submissions = json.result && json.result.submissions;
+        if (!Array.isArray(submissions)) return false;
+        nominations = submissions;
+        scheduleRenderPlotsApp();
+        return true;
+    }
+
+    function parseNominations() {
         try {
-            const response = this.response;
-            const json = JSON.parse(response);
-            if (!json) {
-                console.log('Failed to parse response from Wayfarer');
-                return;
+            const raw = this.response || this.responseText;
+            const json = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (!ingestManageJson(json)) {
+                console.log('[WFNS Plots] Manage response did not include nominations.');
             }
-            // ignore if it's related to captchas
-            if (json.captcha)
-                return;
-
-            nominations = json.result.submissions;
-            if (!nominations) {
-                console.log('Wayfarer\'s response didn\'t include nominations.');
-                return;
-            }
-            setTimeout(() => {
-                renderPlotsApp();
-            }, 300);          
-
-        } catch (e)    {
+        } catch (e) {
             console.log(e); // eslint-disable-line no-console
         }
     }
 
+    /**
+     * Wayfarer Map Mods 4.0 already caches every contribution from the same endpoint.
+     * If it is present we can render immediately instead of waiting for a network call
+     * that may have happened before this script ran.
+     */
+    function nominationsFromMapMods() {
+        try {
+            const list = window.WFMM && window.WFMM.contributions && window.WFMM.contributions.list();
+            if (!Array.isArray(list) || !list.length) return null;
+            return list.map(entry => (entry && entry.raw) || entry).filter(Boolean);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    let renderTimer = 0;
+    function scheduleRenderPlotsApp(delay) {
+        clearTimeout(renderTimer);
+        renderTimer = setTimeout(renderPlotsApp, typeof delay === 'number' ? delay : 300);
+    }
+
+    function isNominationsRoute() {
+        return /\/nominations(\/|$)/.test(window.location.pathname);
+    }
+
     async function renderPlotsApp() {
-        awaitElement(() => document.querySelector('app-submissions-list'))
+        if (!isNominationsRoute()) return;
+        if (!Array.isArray(nominations) || !nominations.length) {
+            const cached = nominationsFromMapMods();
+            if (!cached) return;
+            nominations = cached;
+        }
+        awaitElement(() => findPlotsAnchor())
             .then(() => {
                 addCss();
                 addPlotsSection();
             })
             .catch(() => {
-                console.log("Could not find app-submissions-list.");
+                console.log('[WFNS Plots] Could not find the nominations list container.');
             });
+    }
+
+    /**
+     * The new nominations page wraps the list in <app-submissions>; older builds used
+     * a plain .submissions block. Accept either, and fall back to the list host itself.
+     */
+    function findPlotsAnchor() {
+        const list = document.querySelector('app-submissions-list');
+        if (!list) return null;
+        return document.querySelector('.submissions')
+            || document.querySelector('app-submissions')
+            || list.parentElement
+            || list;
+    }
+
+    /**
+     * The page is a SPA: re-attach when the user navigates back to the nominations
+     * route, and when Angular tears the list down and rebuilds it.
+     */
+    function watchForNominationsRoute() {
+        let lastPath = window.location.pathname;
+        const check = () => {
+            if (window.location.pathname === lastPath) return;
+            lastPath = window.location.pathname;
+            scheduleRenderPlotsApp(200);
+        };
+        ['pushState', 'replaceState'].forEach(name => {
+            const original = history[name];
+            history[name] = function () {
+                const result = original.apply(this, arguments);
+                queueMicrotask(check);
+                return result;
+            };
+        });
+        window.addEventListener('popstate', check);
+
+        let observerTimer = 0;
+        new MutationObserver(() => {
+            if (!isNominationsRoute()) return;
+            if (document.getElementById('wfns-plots-root')) return;
+            if (!document.querySelector('app-submissions-list')) return;
+            clearTimeout(observerTimer);
+            observerTimer = setTimeout(renderPlotsApp, 120);
+        }).observe(document.documentElement, { childList: true, subtree: true });
     }
 
     function addCss() {
@@ -383,7 +711,7 @@ function init() {
                 max-width: none;
             }
 
-            #wfns-bars-wrap { justify-content: flex-start; }
+            .wfns-bars-wrap { justify-content: flex-start; }
 
             /* Control blocks */
             .wfns-control-block {
@@ -487,10 +815,42 @@ function init() {
                 padding: 16px;
             }
 
-            .wfns-chart-title {
-                font-weight: 700;
+            .wfns-chart-card + .wfns-chart-card {
+                margin-top: 16px;
+            }
+
+            .wfns-chart-header {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 6px;
                 margin-bottom: 12px;
+            }
+
+            .wfns-chart-title {
+                flex: 1 1 auto;
+                min-width: 0;
+                font-weight: 700;
+                margin-bottom: 0;
                 color: var(--wfns-text);
+                line-height: 1.35;
+                overflow-wrap: anywhere;
+            }
+
+            .wfns-chart-export-button {
+                flex: 0 0 auto;
+                white-space: nowrap;
+            }
+
+            #wfns-plots-root .wfns-chart-export-button {
+                width: 28px;
+                min-width: 28px;
+                max-width: 28px;
+                height: 22px;
+                padding: 2px 0;
+                font-size: 9px;
+                line-height: 1;
+                text-align: center;
             }
 
             .wfns-legend-item {
@@ -507,6 +867,52 @@ function init() {
                 text-anchor: middle;
                 pointer-events: none;
             }
+
+            /* ── Control section toggles ── */
+            .wfns-sec-toggle {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-weight: 700;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                padding: 6px 14px;
+                margin-bottom: 0;
+                background: var(--wfns-ctrl-bg);
+                border: 1px solid var(--wfns-ctrl-border);
+                border-radius: 6px;
+                color: var(--wfns-ctrl-border);
+                cursor: pointer;
+                user-select: none;
+                transition: background 0.15s;
+            }
+            .wfns-sec-toggle:hover {
+                background: var(--wfns-ctrl-bg2, rgba(223,71,28,0.06));
+            }
+            .wfns-sec-toggle::before {
+                content: '▶';
+                font-size: 9px;
+                display: inline-block;
+                transition: transform 0.2s;
+            }
+
+            /* Section body: hidden by default via display:none so it doesn't
+               interfere with clientWidth measurements on the chart elements. */
+            .wfns-sec-body {
+                display: none;
+                border-left: 2px solid var(--wfns-ctrl-border);
+                margin-left: 6px;
+                border-radius: 0 0 6px 6px;
+            }
+
+            /* checked state: show body + rotate arrow */
+            .wfns-sec-cb:checked + .wfns-sec-toggle::before {
+                transform: rotate(90deg);
+            }
+            .wfns-sec-cb:checked + .wfns-sec-toggle + .wfns-sec-body {
+                display: block;
+            }
             `;
         const style = document.createElement('style');
         style.type = 'text/css';
@@ -518,10 +924,9 @@ function init() {
     function addPlotsSection() {
       if (document.getElementById("wfns-plots-root")) return;
 
-      const list = document.querySelector("app-submissions-list");
-      const submissionsLayout = document.querySelector(".submissions");
+      const submissionsLayout = findPlotsAnchor();
 
-      if (!list || !submissionsLayout) return;
+      if (!submissionsLayout) return;
 
       const root = document.createElement("div");
       root.id = "wfns-plots-root";
@@ -545,7 +950,12 @@ function init() {
       submissionsLayout.insertAdjacentElement("afterend", root);
 
       renderPlotControls();
-      renderPlots();
+      // Defer one frame so the browser has laid out the DOM before we read clientWidth
+      requestAnimationFrame(() => {
+        renderPlots();
+        // Start OSM geocoding AFTER DOM exists so progress bar can inject itself
+        osmStartPrewarm(nominations);
+      });
     }
 
     function renderPlotControls() {
@@ -553,18 +963,9 @@ function init() {
       if (!controls) return;
 
       controls.innerHTML = "";
+      syncVisibleChartScopes();
 
-      const wrapper = document.createElement("div");
-      wrapper.style.cssText = `
-        display: flex;
-        flex-wrap: wrap;
-        gap: 20px;
-        margin-bottom: 16px;
-        align-items: flex-start;
-        justify-content: space-between;
-      `;
-
-      // Helper to create a styled control block with background bar
+      // ── Helpers ──────────────────────────────────────────────────────────────
       function makeControlBlock() {
         const block = document.createElement("div");
         block.className = "wfns-control-block";
@@ -578,158 +979,455 @@ function init() {
         return label;
       }
 
-      // Max bars selector
-      const maxBarsBlock = makeControlBlock();
-      maxBarsBlock.appendChild(makeControlLabel("Max Bars"));
-      const maxBarsSelect = document.createElement("select");
-      maxBarsSelect.id = "wfns-max-bars";
-      maxBarsSelect.style.cssText = "padding: 4px 6px; border-radius: 4px;";
-      [20, 50, 100, 200].forEach(v => {
-        const opt = document.createElement("option");
-        opt.value = v;
-        opt.textContent = v;
-        if (plotState.maxBars === v) opt.selected = true;
-        maxBarsSelect.appendChild(opt);
-      });
-      const allOpt = document.createElement("option");
-      allOpt.value = "all";
-      allOpt.textContent = "All";
-      if (plotState.maxBars === "all") allOpt.selected = true;
-      maxBarsSelect.appendChild(allOpt);
-      maxBarsBlock.appendChild(maxBarsSelect);
-      wrapper.appendChild(maxBarsBlock);
+      // Creates a collapsible section row in the toggle bar
+      function makeSection(title, buildFn) {
+        const section = document.createElement("div");
+        section.style.cssText = "margin-bottom: 6px;";
 
-      // Aggregation selector
-      const aggBlock = makeControlBlock();
-      aggBlock.appendChild(makeControlLabel("Aggregate By"));
-      [["cityState", "City + State"], ["state", "State"]].forEach(([val, text]) => {
+        const uid = "wfns-sec-" + title.replace(/\W+/g, "-").toLowerCase();
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.id = uid;
+        checkbox.className = "wfns-sec-cb"; // dedicated class — does NOT inherit .toggle CSS
+        checkbox.style.display = "none";
+        // Remember collapsed state in plotState to survive re-renders
+        const stateKey = "_sec_" + uid;
+        checkbox.checked = plotState[stateKey] !== false; // default open
+
         const lbl = document.createElement("label");
-        lbl.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
-        lbl.innerHTML = `<input type="radio" name="wfns-agg" value="${val}" ${plotState.aggregationMode === val ? "checked" : ""}> ${text}`;
-        aggBlock.appendChild(lbl);
-      });
-      wrapper.appendChild(aggBlock);
+        lbl.htmlFor = uid;
+        lbl.className = "wfns-sec-toggle";
+        lbl.textContent = title;
 
-      // Timeline area selector
-      const timelineAreaBlock = makeControlBlock();
-      timelineAreaBlock.appendChild(makeControlLabel("Timeline Area"));
-      const timelineAreaSelect = document.createElement("select");
-      timelineAreaSelect.id = "wfns-timeline-area";
-      timelineAreaSelect.style.cssText = "padding: 4px 6px; border-radius: 4px; max-width: 140px;";
-      const allAreaOpt = document.createElement("option");
-      allAreaOpt.value = "__ALL__";
-      allAreaOpt.textContent = "All areas";
-      timelineAreaSelect.appendChild(allAreaOpt);
-      timelineAreaBlock.appendChild(timelineAreaSelect);
-      wrapper.appendChild(timelineAreaBlock);
+        const body = document.createElement("div");
+        body.className = "wfns-sec-body";
 
-      // Timeline mode selector
-      const timelineModeBlock = makeControlBlock();
-      timelineModeBlock.appendChild(makeControlLabel("Timeline Mode"));
-      [["monthly", "Monthly"], ["cumulative", "Cumulative"]].forEach(([val, text]) => {
-        const lbl = document.createElement("label");
-        lbl.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
-        lbl.innerHTML = `<input type="radio" name="wfns-timeline-mode" value="${val}" ${plotState.timelineMode === val ? "checked" : ""}> ${text}`;
-        timelineModeBlock.appendChild(lbl);
-      });
-      wrapper.appendChild(timelineModeBlock);
+        // inner flex row for the control blocks
+        const row = document.createElement("div");
+        row.style.cssText = "display:flex; flex-wrap:wrap; gap:12px; padding:10px 12px 10px 12px; align-items:flex-start;";
+        buildFn(row);
+        body.appendChild(row);
 
-      // Data labels toggle
-      const dataLabelsBlock = makeControlBlock();
-      dataLabelsBlock.appendChild(makeControlLabel("Show Numbers"));
-      const toggleWrap = document.createElement("label");
-      toggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
-      toggleWrap.innerHTML = `
-        <label class="wfns-toggle-switch">
-          <input type="checkbox" id="wfns-data-labels-toggle" ${plotState.showDataLabels ? "checked" : ""}>
-          <span class="wfns-toggle-slider"></span>
-        </label>
-        <span id="wfns-data-labels-text" style="font-size:12px;">${plotState.showDataLabels ? "On" : "Off"}</span>
-      `;
-      dataLabelsBlock.appendChild(toggleWrap);
-      wrapper.appendChild(dataLabelsBlock);
+        checkbox.addEventListener("change", () => {
+          plotState[stateKey] = checkbox.checked;
+        });
 
-      // All submissions overlay toggle
-      const allSubBlock = makeControlBlock();
-      allSubBlock.appendChild(makeControlLabel("All Submissions"));
-      const allSubWrap = document.createElement("label");
-      allSubWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
-      allSubWrap.innerHTML = `
-        <label class="wfns-toggle-switch">
-          <input type="checkbox" id="wfns-all-submissions-toggle" ${plotState.showAllSubmissions ? "checked" : ""}>
-          <span class="wfns-toggle-slider"></span>
-        </label>
-        <span id="wfns-all-submissions-text" style="font-size:12px;">${plotState.showAllSubmissions ? "On" : "Off"}</span>
-      `;
-      const allSubNote = document.createElement("div");
-      allSubNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
-      allSubNote.textContent = "Shows total regardless of status";
-      allSubBlock.appendChild(allSubWrap);
-      allSubBlock.appendChild(allSubNote);
-      wrapper.appendChild(allSubBlock);
+        section.appendChild(checkbox);
+        section.appendChild(lbl);
+        section.appendChild(body);
+        return section;
+      }
 
-      // Type selector
-      const typeBlock = makeControlBlock();
-      typeBlock.appendChild(makeControlLabel("Types"));
-      PLOT_TYPE_OPTIONS.forEach(type => {
-        const label = document.createElement("label");
-        label.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
-        label.innerHTML = `<input type="checkbox" data-type="${type}" ${plotState.selectedTypes.has(type) ? "checked" : ""}> ${TYPE_DISPLAY[type] || type}`;
-        typeBlock.appendChild(label);
-      });
-      wrapper.appendChild(typeBlock);
+      // ── Section 1: Chart selection ────────────────────────────────────────────
+      controls.appendChild(makeSection("Chart selection", (row) => {
+        const chartScopes = getChartScopeOptions();
+        if (chartScopes.length < 2) {
+          row.style.display = "none";
+          row.style.padding = "0";
+          return;
+        }
 
-      // Status selector
-      const statusBlock = makeControlBlock();
-      statusBlock.appendChild(makeControlLabel("Statuses"));
-      PLOT_STATUS_TYPES.forEach(status => {
-        const label = document.createElement("label");
-        label.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
-        label.innerHTML = `<input type="checkbox" data-status="${status}" ${plotState.selectedStatuses.has(status) ? "checked" : ""}> ${STATUS_DISPLAY[status] || status}`;
-        statusBlock.appendChild(label);
-      });
-      wrapper.appendChild(statusBlock);
+        const chartShownBlock = makeControlBlock();
+        chartShownBlock.appendChild(makeControlLabel("Chart Shown"));
 
-      // Export buttons
-      const exportBlock = document.createElement("div");
-      exportBlock.style.cssText = `
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-        margin-left: auto;
-        min-width: 180px;
-      `;
-      exportBlock.innerHTML = `
-        <div>
-          <div style="font-weight: 600; margin-bottom: 6px; color: var(--wfns-text);">Export area plot</div>
-          <button id="wfns-export-area-image" style="
-            padding: 6px 10px;
-            border-radius: 4px;
-            border: 1px solid var(--wfns-border);
-            background: var(--wfns-btn-bg);
-            color: var(--wfns-btn-text);
-            cursor: pointer;
-            width: 100%;
-          ">Download Area PNG</button>
-        </div>
-        <div>
-          <div style="font-weight: 600; margin-bottom: 6px; color: var(--wfns-text);">Export timeline plot</div>
-          <button id="wfns-export-timeline-image" style="
-            padding: 6px 10px;
-            border-radius: 4px;
-            border: 1px solid var(--wfns-border);
-            background: var(--wfns-btn-bg);
-            color: var(--wfns-btn-text);
-            cursor: pointer;
-            width: 100%;
-          ">Download Timeline PNG</button>
-        </div>
-      `;
-      wrapper.appendChild(exportBlock);
+        chartScopes.forEach(scope => {
+          const label = document.createElement("label");
+          label.style.cssText = "display:block; margin-bottom:4px; cursor:pointer; white-space:nowrap;";
+          label.innerHTML = `<input type="checkbox" data-chart-scope="${scope.key}" ${plotState.visibleChartScopes.has(scope.key) ? "checked" : ""}> ${scope.label}`;
+          if (scope.key === CHART_SCOPE_ALL_SELECTED) {
+            label.title = "Includes every selected type.";
+          }
+          chartShownBlock.appendChild(label);
+        });
 
-      controls.appendChild(wrapper);
+        const chartShownNote = document.createElement("div");
+        chartShownNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
+        chartShownNote.textContent = "Applies to Area and Timeline plots";
+        chartShownBlock.appendChild(chartShownNote);
+        row.appendChild(chartShownBlock);
+      }));
 
-      // Populate timeline area dropdown
+      // ── Section 2: Type / Status ──────────────────────────────────────────────
+      controls.appendChild(makeSection("Type / Status", (row) => {
+        // Types
+        const typeBlock = makeControlBlock();
+        typeBlock.appendChild(makeControlLabel("Types"));
+        PLOT_TYPE_OPTIONS.forEach(type => {
+          const label = document.createElement("label");
+          label.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
+          label.innerHTML = `<input type="checkbox" data-type="${type}" ${plotState.selectedTypes.has(type) ? "checked" : ""}> ${TYPE_DISPLAY[type] || type}`;
+          typeBlock.appendChild(label);
+        });
+        row.appendChild(typeBlock);
+
+        // Status split into two columns
+        const statusBlock = makeControlBlock();
+        statusBlock.appendChild(makeControlLabel("Statuses"));
+        const statusCols = document.createElement("div");
+        statusCols.style.cssText = "display:flex; gap:14px;";
+        const col1 = document.createElement("div");
+        const col2 = document.createElement("div");
+        const half = Math.ceil(PLOT_STATUS_TYPES.length / 2);
+        PLOT_STATUS_TYPES.forEach((status, idx) => {
+          const label = document.createElement("label");
+          label.style.cssText = "display:block; margin-bottom:4px; cursor:pointer; white-space:nowrap;";
+          label.innerHTML = `<input type="checkbox" data-status="${status}" ${plotState.selectedStatuses.has(status) ? "checked" : ""}> ${STATUS_DISPLAY[status] || status}`;
+          (idx < half ? col1 : col2).appendChild(label);
+        });
+        statusCols.appendChild(col1);
+        statusCols.appendChild(col2);
+        statusBlock.appendChild(statusCols);
+        row.appendChild(statusBlock);
+
+        // Date Range for both charts (by Type/Status)
+        const tsDateRangeBlock = makeControlBlock();
+        tsDateRangeBlock.appendChild(makeControlLabel("Date Range (Both)"));
+        const tsDateToggleWrap = document.createElement("label");
+        tsDateToggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px;";
+        tsDateToggleWrap.innerHTML = `
+          <label class="wfns-toggle-switch">
+            <input type="checkbox" id="wfns-ts-date-range-toggle" ${plotState.typeStatusRangeEnabled ? "checked" : ""}>
+            <span class="wfns-toggle-slider"></span>
+          </label>
+          <span id="wfns-ts-date-range-text" style="font-size:12px;">${plotState.typeStatusRangeEnabled ? "On" : "Off"}</span>
+        `;
+        tsDateRangeBlock.appendChild(tsDateToggleWrap);
+        const tsDateInputsWrap = document.createElement("div");
+        tsDateInputsWrap.id = "wfns-ts-date-range-inputs";
+        tsDateInputsWrap.style.cssText = `display:${plotState.typeStatusRangeEnabled ? "flex" : "none"}; flex-direction:column; gap:6px;`;
+        tsDateInputsWrap.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:2px;">
+            <span style="font-size:10px; color:var(--wfns-text-muted,#888);">From</span>
+            <input type="date" id="wfns-ts-range-start" value="${plotState.typeStatusRangeStart}" style="
+              padding:3px 6px; border-radius:4px; font-size:11px;
+              background:var(--wfns-input-bg); color:var(--wfns-input-text);
+              border:1px solid var(--wfns-border); cursor:pointer;">
+          </div>
+          <div style="display:flex; flex-direction:column; gap:2px;">
+            <span style="font-size:10px; color:var(--wfns-text-muted,#888);">To</span>
+            <input type="date" id="wfns-ts-range-end" value="${plotState.typeStatusRangeEnd}" style="
+              padding:3px 6px; border-radius:4px; font-size:11px;
+              background:var(--wfns-input-bg); color:var(--wfns-input-text);
+              border:1px solid var(--wfns-border); cursor:pointer;">
+          </div>
+          <div id="wfns-ts-range-info" style="font-size:10px; color:var(--wfns-text-muted,#888); margin-top:2px;"></div>
+          <div style="font-size:10px; color:var(--wfns-text-muted,#888); margin-top:2px; max-width:130px; line-height:1.3;">Filters both Area and Timeline charts</div>
+        `;
+        tsDateRangeBlock.appendChild(tsDateInputsWrap);
+        row.appendChild(tsDateRangeBlock);
+
+        // All Submissions in area chart toggle
+        const allSubAreaBlock = makeControlBlock();
+        allSubAreaBlock.appendChild(makeControlLabel("Show All Submissions (Area Bar Plot)"));
+        const allSubAreaWrap = document.createElement("label");
+        allSubAreaWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
+        allSubAreaWrap.innerHTML = `
+          <label class="wfns-toggle-switch">
+            <input type="checkbox" id="wfns-all-submissions-area-toggle" ${plotState.showAllSubmissionsArea ? "checked" : ""}>
+            <span class="wfns-toggle-slider"></span>
+          </label>
+          <span id="wfns-all-submissions-area-text" style="font-size:12px;">${plotState.showAllSubmissionsArea ? "On" : "Off"}</span>
+        `;
+        const allSubAreaNote = document.createElement("div");
+        allSubAreaNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
+        allSubAreaNote.textContent = "Show unselected statuses as blank";
+        allSubAreaBlock.appendChild(allSubAreaWrap);
+        allSubAreaBlock.appendChild(allSubAreaNote);
+        row.appendChild(allSubAreaBlock);
+
+        // All submissions overlay toggle
+        const allSubBlock = makeControlBlock();
+        allSubBlock.appendChild(makeControlLabel("Show All Submissions (Timeline Plot)"));
+        const allSubWrap = document.createElement("label");
+        allSubWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
+        allSubWrap.innerHTML = `
+          <label class="wfns-toggle-switch">
+            <input type="checkbox" id="wfns-all-submissions-toggle" ${plotState.showAllSubmissions ? "checked" : ""}>
+            <span class="wfns-toggle-slider"></span>
+          </label>
+          <span id="wfns-all-submissions-text" style="font-size:12px;">${plotState.showAllSubmissions ? "On" : "Off"}</span>
+        `;
+        const allSubNote = document.createElement("div");
+        allSubNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
+        allSubNote.textContent = "Shows current chart types regardless of status";
+        allSubBlock.appendChild(allSubWrap);
+        allSubBlock.appendChild(allSubNote);
+        row.appendChild(allSubBlock);
+      }));
+
+      // ── Section 3: By Area ────────────────────────────────────────────────────
+      controls.appendChild(makeSection("By Area", (row) => {
+        // Aggregation
+        const aggBlock = makeControlBlock();
+        aggBlock.appendChild(makeControlLabel("Aggregate By"));
+        [
+          ["cityState", "City + State"],
+          ["state",     "State"],
+          ["osm",       "OSM Town·City·Country ★"]
+        ].forEach(([val, text]) => {
+          const lbl = document.createElement("label");
+          lbl.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
+          lbl.innerHTML = `<input type="radio" name="wfns-agg" value="${val}" ${plotState.aggregationMode === val ? "checked" : ""}> ${text}`;
+          aggBlock.appendChild(lbl);
+        });
+        row.appendChild(aggBlock);
+
+        const maxBarsBlock = makeControlBlock();
+        maxBarsBlock.appendChild(makeControlLabel("Max Bars"));
+        const maxBarsSelect = document.createElement("select");
+        maxBarsSelect.id = "wfns-max-bars";
+        maxBarsSelect.style.cssText = "padding: 4px 6px; border-radius: 4px;";
+        [20, 50, 100, 200].forEach(v => {
+          const opt = document.createElement("option");
+          opt.value = v; opt.textContent = v;
+          if (plotState.maxBars === v) opt.selected = true;
+          maxBarsSelect.appendChild(opt);
+        });
+        const allOpt = document.createElement("option");
+        allOpt.value = "all"; allOpt.textContent = "All";
+        if (plotState.maxBars === "all") allOpt.selected = true;
+        maxBarsSelect.appendChild(allOpt);
+        maxBarsBlock.appendChild(maxBarsSelect);
+        row.appendChild(maxBarsBlock);
+
+        // OSM cache block
+        const osmBlock = makeControlBlock();
+        osmBlock.appendChild(makeControlLabel("OSM Cache"));
+        const osmInfo = document.createElement("div");
+        osmInfo.id = "wfns-osm-cache-count";
+        osmInfo.style.cssText = "font-size:11px; margin-bottom:6px; color:var(--wfns-text-muted,#888);";
+        osmInfo.textContent = `${osmCacheSize()} coords cached`;
+        osmBlock.appendChild(osmInfo);
+        const osmNote = document.createElement("div");
+        osmNote.style.cssText = "font-size:10px; margin-bottom:6px; color:var(--wfns-text-muted,#888); max-width:140px; line-height:1.3;";
+        osmNote.textContent = "Select \"OSM Town·City·Country\" to geocode coords via OpenStreetMap (1 req/s, stored forever). Labels: Town, City/County, Country.";
+        osmBlock.appendChild(osmNote);
+        const osmBtnWrap = document.createElement("div");
+        osmBtnWrap.style.cssText = "display:flex; flex-direction:column; gap:4px;";
+
+        const osmExportBtn = document.createElement("button");
+        osmExportBtn.textContent = "⬇ Export Cache";
+        osmExportBtn.style.cssText = "font-size:11px; padding:4px 8px; width:auto;";
+        osmExportBtn.addEventListener("click", () => {
+          try {
+            const raw = localStorage.getItem(OSM_CACHE_KEY) || "{}";
+            const blob = new Blob([raw], { type: "application/json" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            const date = new Date().toISOString().slice(0, 10);
+            a.download = `WayfarerOSMCache_${date}.json`;
+            a.href = url;
+            a.click();
+            URL.revokeObjectURL(url);
+          } catch (err) { console.log("OSM cache export failed:", err); }
+        });
+
+        const osmImportBtn = document.createElement("button");
+        osmImportBtn.textContent = "⬆ Import Cache";
+        osmImportBtn.style.cssText = "font-size:11px; padding:4px 8px; width:auto;";
+        osmImportBtn.addEventListener("click", () => {
+          const input = document.createElement("input");
+          input.type = "file";
+          input.accept = ".json,application/json";
+          input.addEventListener("change", () => {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (ev) => {
+              try {
+                const imported = JSON.parse(ev.target.result);
+                const raw = localStorage.getItem(OSM_CACHE_KEY);
+                const existing = raw ? JSON.parse(raw) : {};
+                const merged = Object.assign({}, existing, imported);
+                localStorage.setItem(OSM_CACHE_KEY, JSON.stringify(merged));
+                osmInfo.textContent = `${osmCacheSize()} coords cached`;
+                if (plotState.aggregationMode === "osm") renderPlots();
+              } catch (err) { console.log("OSM cache import failed:", err); }
+            };
+            reader.readAsText(file);
+          });
+          input.click();
+        });
+
+        const osmClearBtn = document.createElement("button");
+        osmClearBtn.textContent = "Clear & Re-fetch";
+        osmClearBtn.style.cssText = "font-size:11px; padding:4px 8px; width:auto;";
+        osmClearBtn.addEventListener("click", () => {
+          localStorage.removeItem(OSM_CACHE_KEY);
+          osmInfo.textContent = "0 coords cached";
+          osmStartPrewarm(nominations);
+        });
+
+        osmBtnWrap.appendChild(osmExportBtn);
+        osmBtnWrap.appendChild(osmImportBtn);
+        osmBtnWrap.appendChild(osmClearBtn);
+        osmBlock.appendChild(osmBtnWrap);
+        row.appendChild(osmBlock);
+
+        // Date Range for Area chart
+        const areaDateRangeBlock = makeControlBlock();
+        areaDateRangeBlock.id = "wfns-area-date-range-block";
+        areaDateRangeBlock.appendChild(makeControlLabel("Area Date Range"));
+        // Fade + block if Date Range (Both) is active
+        const _applyAreaRangeBlockedState = () => {
+          const blocked = plotState.typeStatusRangeEnabled;
+          areaDateRangeBlock.style.opacity = blocked ? "0.4" : "1";
+          areaDateRangeBlock.style.pointerEvents = blocked ? "none" : "";
+          areaDateRangeBlock.title = blocked ? "Date Range (Both) is On — disable it first" : "";
+        };
+        _applyAreaRangeBlockedState();
+        const areaDateToggleWrap = document.createElement("label");
+        areaDateToggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px;";
+        areaDateToggleWrap.innerHTML = `
+          <label class="wfns-toggle-switch">
+            <input type="checkbox" id="wfns-area-date-range-toggle" ${plotState.areaRangeEnabled ? "checked" : ""}>
+            <span class="wfns-toggle-slider"></span>
+          </label>
+          <span id="wfns-area-date-range-text" style="font-size:12px;">${plotState.areaRangeEnabled ? "On" : "Off"}</span>
+        `;
+        areaDateRangeBlock.appendChild(areaDateToggleWrap);
+        const areaDateInputsWrap = document.createElement("div");
+        areaDateInputsWrap.id = "wfns-area-date-range-inputs";
+        areaDateInputsWrap.style.cssText = `display:${plotState.areaRangeEnabled ? "flex" : "none"}; flex-direction:column; gap:6px;`;
+        areaDateInputsWrap.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:2px;">
+            <span style="font-size:10px; color:var(--wfns-text-muted,#888);">From</span>
+            <input type="date" id="wfns-area-range-start" value="${plotState.areaRangeStart}" style="
+              padding:3px 6px; border-radius:4px; font-size:11px;
+              background:var(--wfns-input-bg); color:var(--wfns-input-text);
+              border:1px solid var(--wfns-border); cursor:pointer;">
+          </div>
+          <div style="display:flex; flex-direction:column; gap:2px;">
+            <span style="font-size:10px; color:var(--wfns-text-muted,#888);">To</span>
+            <input type="date" id="wfns-area-range-end" value="${plotState.areaRangeEnd}" style="
+              padding:3px 6px; border-radius:4px; font-size:11px;
+              background:var(--wfns-input-bg); color:var(--wfns-input-text);
+              border:1px solid var(--wfns-border); cursor:pointer;">
+          </div>
+          <div id="wfns-area-range-info" style="font-size:10px; color:var(--wfns-text-muted,#888); margin-top:2px;"></div>
+        `;
+        areaDateRangeBlock.appendChild(areaDateInputsWrap);
+        row.appendChild(areaDateRangeBlock);
+
+        // Timeline area filter
+        const timelineAreaBlock = makeControlBlock();
+        timelineAreaBlock.appendChild(makeControlLabel("Timeline Area"));
+        const timelineAreaSelect = document.createElement("select");
+        timelineAreaSelect.id = "wfns-timeline-area";
+        timelineAreaSelect.style.cssText = "padding: 4px 6px; border-radius: 4px; max-width: 140px;";
+        const allAreaOpt = document.createElement("option");
+        allAreaOpt.value = "__ALL__"; allAreaOpt.textContent = "All areas";
+        timelineAreaSelect.appendChild(allAreaOpt);
+        timelineAreaBlock.appendChild(timelineAreaSelect);
+
+        // Province-only checkbox
+        const provinceOnlyLabel = document.createElement("label");
+        provinceOnlyLabel.style.cssText = "display:flex; align-items:center; gap:6px; margin-top:8px; cursor:pointer; font-size:11px; color:var(--wfns-text);";
+        const provinceOnlyCb = document.createElement("input");
+        provinceOnlyCb.type = "checkbox";
+        provinceOnlyCb.id = "wfns-province-only";
+        provinceOnlyCb.checked = plotState.timelineAreaProvinceOnly;
+        provinceOnlyLabel.appendChild(provinceOnlyCb);
+        provinceOnlyLabel.appendChild(document.createTextNode("City/Province level only"));
+        timelineAreaBlock.appendChild(provinceOnlyLabel);
+
+        row.appendChild(timelineAreaBlock);
+      }));
+
+      // ── Section 4: Chart ──────────────────────────────────────────────────────
+      controls.appendChild(makeSection("Chart", (row) => {
+        // Date Range
+        const dateRangeBlock = makeControlBlock();
+        dateRangeBlock.id = "wfns-chart-date-range-block";
+        dateRangeBlock.appendChild(makeControlLabel("Date Range"));
+        // Fade + block if Date Range (Both) is active
+        const _applyChartRangeBlockedState = () => {
+          const blocked = plotState.typeStatusRangeEnabled;
+          dateRangeBlock.style.opacity = blocked ? "0.4" : "1";
+          dateRangeBlock.style.pointerEvents = blocked ? "none" : "";
+          dateRangeBlock.title = blocked ? "Date Range (Both) is On — disable it first" : "";
+        };
+        _applyChartRangeBlockedState();
+        const dateRangeToggleWrap = document.createElement("label");
+        dateRangeToggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px;";
+        dateRangeToggleWrap.innerHTML = `
+          <label class="wfns-toggle-switch">
+            <input type="checkbox" id="wfns-date-range-toggle" ${plotState.timelineRangeEnabled ? "checked" : ""}>
+            <span class="wfns-toggle-slider"></span>
+          </label>
+          <span id="wfns-date-range-text" style="font-size:12px;">${plotState.timelineRangeEnabled ? "On" : "Off"}</span>
+        `;
+        dateRangeBlock.appendChild(dateRangeToggleWrap);
+        const dateInputsWrap = document.createElement("div");
+        dateInputsWrap.id = "wfns-date-range-inputs";
+        dateInputsWrap.style.cssText = `display:${plotState.timelineRangeEnabled ? "flex" : "none"}; flex-direction:column; gap:6px;`;
+        dateInputsWrap.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:2px;">
+            <span style="font-size:10px; color:var(--wfns-text-muted,#888);">From</span>
+            <input type="date" id="wfns-range-start" value="${plotState.timelineRangeStart}" style="
+              padding:3px 6px; border-radius:4px; font-size:11px;
+              background:var(--wfns-input-bg); color:var(--wfns-input-text);
+              border:1px solid var(--wfns-border); cursor:pointer;">
+          </div>
+          <div style="display:flex; flex-direction:column; gap:2px;">
+            <span style="font-size:10px; color:var(--wfns-text-muted,#888);">To</span>
+            <input type="date" id="wfns-range-end" value="${plotState.timelineRangeEnd}" style="
+              padding:3px 6px; border-radius:4px; font-size:11px;
+              background:var(--wfns-input-bg); color:var(--wfns-input-text);
+              border:1px solid var(--wfns-border); cursor:pointer;">
+          </div>
+          <div id="wfns-range-info" style="font-size:10px; color:var(--wfns-text-muted,#888); margin-top:2px;"></div>
+        `;
+        dateRangeBlock.appendChild(dateInputsWrap);
+        row.appendChild(dateRangeBlock);
+
+        // Timeline mode (monthly/cumulative)
+        const timelineModeBlock = makeControlBlock();
+        timelineModeBlock.appendChild(makeControlLabel("Timeline Mode"));
+        [["monthly", "Monthly"], ["cumulative", "Cumulative"]].forEach(([val, text]) => {
+          const lbl = document.createElement("label");
+          lbl.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
+          lbl.innerHTML = `<input type="radio" name="wfns-timeline-mode" value="${val}" ${plotState.timelineMode === val ? "checked" : ""}> ${text}`;
+          timelineModeBlock.appendChild(lbl);
+        });
+        row.appendChild(timelineModeBlock);
+
+        // Show Numbers toggle
+        const dataLabelsBlock = makeControlBlock();
+        dataLabelsBlock.appendChild(makeControlLabel("Show Numbers"));
+        const toggleWrap = document.createElement("label");
+        toggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
+        toggleWrap.innerHTML = `
+          <label class="wfns-toggle-switch">
+            <input type="checkbox" id="wfns-data-labels-toggle" ${plotState.showDataLabels ? "checked" : ""}>
+            <span class="wfns-toggle-slider"></span>
+          </label>
+          <span id="wfns-data-labels-text" style="font-size:12px;">${plotState.showDataLabels ? "On" : "Off"}</span>
+        `;
+        dataLabelsBlock.appendChild(toggleWrap);
+        row.appendChild(dataLabelsBlock);
+
+        // Chart view mode
+        const chartViewBlock = makeControlBlock();
+        chartViewBlock.appendChild(makeControlLabel("Chart View"));
+        [
+          ["responsive", "Responsive (fit width)"],
+          ["scrollable", "Scrollable (fixed months)"]
+        ].forEach(([val, text]) => {
+          const lbl = document.createElement("label");
+          lbl.style.cssText = "display:block; margin-bottom:4px; cursor:pointer;";
+          lbl.innerHTML = `<input type="radio" name="wfns-chart-view" value="${val}" ${plotState.timelineViewMode === val ? "checked" : ""}> ${text}`;
+          chartViewBlock.appendChild(lbl);
+        });
+        const chartViewNote = document.createElement("div");
+        chartViewNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
+        chartViewNote.textContent = "Responsive auto-hides labels at scale";
+        chartViewBlock.appendChild(chartViewNote);
+        row.appendChild(chartViewBlock);
+      }));
+
+      // ── Populate timeline area dropdown ───────────────────────────────────────
+      const timelineAreaSelect = controls.querySelector("#wfns-timeline-area");
       if (timelineAreaSelect) {
         const areas = getAvailableAreas(nominations);
 
@@ -755,6 +1453,29 @@ function init() {
         });
       }
 
+      // Province-only checkbox listener
+      const provinceOnlyCbEl = controls.querySelector("#wfns-province-only");
+      if (provinceOnlyCbEl) {
+        provinceOnlyCbEl.addEventListener("change", (e) => {
+          plotState.timelineAreaProvinceOnly = e.target.checked;
+          plotState.timelineAreaFilter = "__ALL__"; // reset selection when mode changes
+          // Repopulate the dropdown
+          const sel = controls.querySelector("#wfns-timeline-area");
+          if (sel) {
+            // Clear all options except "All areas"
+            while (sel.options.length > 1) sel.remove(1);
+            const newAreas = getAvailableAreas(nominations);
+            newAreas.forEach(area => {
+              const opt = document.createElement("option");
+              opt.value = area; opt.textContent = area;
+              sel.appendChild(opt);
+            });
+            sel.value = "__ALL__";
+          }
+          renderPlots();
+        });
+      }
+
       // Event listeners
       controls.querySelectorAll('input[name="wfns-agg"]').forEach(input => {
         input.addEventListener("change", (e) => {
@@ -772,6 +1493,24 @@ function init() {
         });
       });
 
+      controls.querySelectorAll("input[data-chart-scope]").forEach(input => {
+        input.addEventListener("change", (e) => {
+          const scopeKey = e.target.dataset.chartScope;
+          if (!(plotState.visibleChartScopes instanceof Set)) syncVisibleChartScopes();
+
+          if (e.target.checked) {
+            plotState.visibleChartScopes.add(scopeKey);
+          } else if (plotState.visibleChartScopes.size <= 1) {
+            e.target.checked = true;
+            return;
+          } else {
+            plotState.visibleChartScopes.delete(scopeKey);
+          }
+
+          renderPlots();
+        });
+      });
+
       controls.querySelectorAll("input[data-type]").forEach(input => {
         input.addEventListener("change", (e) => {
           const type = e.target.dataset.type;
@@ -780,6 +1519,8 @@ function init() {
           } else {
             plotState.selectedTypes.delete(type);
           }
+          syncVisibleChartScopes();
+          renderPlotControls();
           renderPlots();
         });
       });
@@ -818,35 +1559,249 @@ function init() {
         });
       }
 
-      if (maxBarsSelect) {
-        maxBarsSelect.addEventListener("change", (e) => {
+      // All submissions area chart toggle listener
+      const allSubAreaToggle = controls.querySelector("#wfns-all-submissions-area-toggle");
+      if (allSubAreaToggle) {
+        allSubAreaToggle.addEventListener("change", (e) => {
+          plotState.showAllSubmissionsArea = e.target.checked;
+          const span = controls.querySelector("#wfns-all-submissions-area-text");
+          if (span) span.textContent = plotState.showAllSubmissionsArea ? "On" : "Off";
+          renderPlots();
+        });
+      }
+
+      // Chart view mode listener
+      controls.querySelectorAll('input[name="wfns-chart-view"]').forEach(input => {
+        input.addEventListener("change", (e) => {
+          plotState.timelineViewMode = e.target.value;
+          renderPlots();
+        });
+      });
+
+      // Date range toggle listener
+      const dateRangeToggle = controls.querySelector("#wfns-date-range-toggle");
+      const dateRangeInputsWrap = controls.querySelector("#wfns-date-range-inputs");
+      if (dateRangeToggle) {
+        dateRangeToggle.addEventListener("change", (e) => {
+          plotState.timelineRangeEnabled = e.target.checked;
+          const span = controls.querySelector("#wfns-date-range-text");
+          if (span) span.textContent = plotState.timelineRangeEnabled ? "On" : "Off";
+          if (dateRangeInputsWrap) {
+            dateRangeInputsWrap.style.display = plotState.timelineRangeEnabled ? "flex" : "none";
+          }
+          renderPlots();
+        });
+      }
+
+      // Date input listeners
+      const rangeStartInput = controls.querySelector("#wfns-range-start");
+      const rangeEndInput   = controls.querySelector("#wfns-range-end");
+      if (rangeStartInput) {
+        rangeStartInput.addEventListener("change", (e) => {
+          plotState.timelineRangeStart = e.target.value;
+          renderPlots();
+        });
+      }
+      if (rangeEndInput) {
+        rangeEndInput.addEventListener("change", (e) => {
+          plotState.timelineRangeEnd = e.target.value;
+          renderPlots();
+        });
+      }
+
+      // maxBarsSelect listener — query from DOM since it's built inside a closure
+      const maxBarsSelectEl = controls.querySelector("#wfns-max-bars");
+      if (maxBarsSelectEl) {
+        maxBarsSelectEl.addEventListener("change", (e) => {
           plotState.maxBars = e.target.value === "all" ? "all" : Number(e.target.value);
           renderPlots();
         });
       }
 
-      const exportAreaBtn = controls.querySelector("#wfns-export-area-image");
-      if (exportAreaBtn) {
-        exportAreaBtn.addEventListener("click", () => {
-          exportAreaPlotAsPng();
+      // Type/Status date range listeners (affects both charts)
+      const tsDateRangeToggle = controls.querySelector("#wfns-ts-date-range-toggle");
+      const tsDateInputsWrapEl = controls.querySelector("#wfns-ts-date-range-inputs");
+      if (tsDateRangeToggle) {
+        tsDateRangeToggle.addEventListener("change", (e) => {
+          plotState.typeStatusRangeEnabled = e.target.checked;
+          const span = controls.querySelector("#wfns-ts-date-range-text");
+          if (span) span.textContent = plotState.typeStatusRangeEnabled ? "On" : "Off";
+          if (tsDateInputsWrapEl) {
+            tsDateInputsWrapEl.style.display = plotState.typeStatusRangeEnabled ? "flex" : "none";
+          }
+          // When turning On: force area/chart ranges off and fade them
+          if (plotState.typeStatusRangeEnabled) {
+            plotState.areaRangeEnabled = false;
+            plotState.timelineRangeEnabled = false;
+          }
+          // Refresh blocked state for area date range block
+          const areaBlock = controls.querySelector("#wfns-area-date-range-block");
+          if (areaBlock) {
+            const blocked = plotState.typeStatusRangeEnabled;
+            areaBlock.style.opacity = blocked ? "0.4" : "1";
+            areaBlock.style.pointerEvents = blocked ? "none" : "";
+            areaBlock.title = blocked ? "Date Range (Both) is On — disable it first" : "";
+          }
+          // Refresh blocked state for chart date range block
+          const chartBlock = controls.querySelector("#wfns-chart-date-range-block");
+          if (chartBlock) {
+            const blocked = plotState.typeStatusRangeEnabled;
+            chartBlock.style.opacity = blocked ? "0.4" : "1";
+            chartBlock.style.pointerEvents = blocked ? "none" : "";
+            chartBlock.title = blocked ? "Date Range (Both) is On — disable it first" : "";
+          }
+          renderPlots();
+        });
+      }
+      const tsRangeStartInput = controls.querySelector("#wfns-ts-range-start");
+      const tsRangeEndInput   = controls.querySelector("#wfns-ts-range-end");
+      if (tsRangeStartInput) {
+        tsRangeStartInput.addEventListener("change", (e) => {
+          plotState.typeStatusRangeStart = e.target.value;
+          renderPlots();
+        });
+      }
+      if (tsRangeEndInput) {
+        tsRangeEndInput.addEventListener("change", (e) => {
+          plotState.typeStatusRangeEnd = e.target.value;
+          renderPlots();
         });
       }
 
-      const exportTimelineBtn = controls.querySelector("#wfns-export-timeline-image");
-      if (exportTimelineBtn) {
-        exportTimelineBtn.addEventListener("click", () => {
-          exportTimelinePlotAsPng();
+      // Area date range listeners
+      const areaDateRangeToggle = controls.querySelector("#wfns-area-date-range-toggle");
+      const areaDateInputsWrapEl = controls.querySelector("#wfns-area-date-range-inputs");
+      if (areaDateRangeToggle) {
+        areaDateRangeToggle.addEventListener("change", (e) => {
+          plotState.areaRangeEnabled = e.target.checked;
+          const span = controls.querySelector("#wfns-area-date-range-text");
+          if (span) span.textContent = plotState.areaRangeEnabled ? "On" : "Off";
+          if (areaDateInputsWrapEl) {
+            areaDateInputsWrapEl.style.display = plotState.areaRangeEnabled ? "flex" : "none";
+          }
+          renderPlots();
         });
       }
+      const areaRangeStartInput = controls.querySelector("#wfns-area-range-start");
+      const areaRangeEndInput   = controls.querySelector("#wfns-area-range-end");
+      if (areaRangeStartInput) {
+        areaRangeStartInput.addEventListener("change", (e) => {
+          plotState.areaRangeStart = e.target.value;
+          renderPlots();
+        });
+      }
+      if (areaRangeEndInput) {
+        areaRangeEndInput.addEventListener("change", (e) => {
+          plotState.areaRangeEnd = e.target.value;
+          renderPlots();
+        });
+      }
+      // Export buttons are wired directly inside the makeSection closure above.
+    }
+
+    function getSelectedTypesInOrder() {
+      return PLOT_TYPE_OPTIONS.filter(type => plotState.selectedTypes.has(type));
+    }
+
+    function getTypeTitle(type) {
+      return TYPE_TITLE_DISPLAY[type] || TYPE_DISPLAY[type] || type;
+    }
+
+    function getTypesTitle(types) {
+      return types.map(getTypeTitle).join(", ");
+    }
+
+    function getChartScopeOptions() {
+      const selectedTypes = getSelectedTypesInOrder();
+      if (!selectedTypes.length) return [];
+
+      const typeScopes = selectedTypes.map(type => ({
+        key: type,
+        types: [type],
+        label: TYPE_DISPLAY[type] || type,
+        titleLabel: getTypeTitle(type),
+        filenamePart: type.toLowerCase().replace(/_/g, "-")
+      }));
+
+      if (selectedTypes.length < 2) return typeScopes;
+
+      return [{
+        key: CHART_SCOPE_ALL_SELECTED,
+        types: selectedTypes,
+        label: "All submissions",
+        titleLabel: getTypesTitle(selectedTypes),
+        filenamePart: "all-selected-types"
+      }, ...typeScopes];
+    }
+
+    function syncVisibleChartScopes() {
+      const options = getChartScopeOptions();
+      const optionKeys = new Set(options.map(option => option.key));
+
+      if (options.length <= 1) {
+        plotState.visibleChartScopes = new Set(options.map(option => option.key));
+        plotState._chartScopeOptionKeys = optionKeys;
+        return;
+      }
+
+      if (!(plotState.visibleChartScopes instanceof Set)) {
+        plotState.visibleChartScopes = new Set(optionKeys);
+        plotState._chartScopeOptionKeys = optionKeys;
+        return;
+      }
+
+      const previousOptionKeys = plotState._chartScopeOptionKeys instanceof Set
+        ? plotState._chartScopeOptionKeys
+        : new Set();
+      const visible = new Set(
+        Array.from(plotState.visibleChartScopes).filter(key => optionKeys.has(key))
+      );
+
+      optionKeys.forEach(key => {
+        if (!previousOptionKeys.has(key)) visible.add(key);
+      });
+
+      if (!visible.size && optionKeys.has(CHART_SCOPE_ALL_SELECTED)) {
+        visible.add(CHART_SCOPE_ALL_SELECTED);
+      } else if (!visible.size && options[0]) {
+        visible.add(options[0].key);
+      }
+
+      plotState.visibleChartScopes = visible;
+      plotState._chartScopeOptionKeys = optionKeys;
+    }
+
+    function getVisibleChartScopes() {
+      syncVisibleChartScopes();
+      const options = getChartScopeOptions();
+      if (options.length <= 1) return options;
+      return options.filter(option => plotState.visibleChartScopes.has(option.key));
+    }
+
+    function nominationMatchesChartScope(nomination, chartScope) {
+      if (!chartScope || !chartScope.types || !chartScope.types.length) return false;
+      return chartScope.types.some(type => nominationMatchesSelectedType(nomination, type));
+    }
+
+    function getChartScopeFilenamePart(chartScope) {
+      if (!chartScope) return "unknown";
+      return chartScope.filenamePart || String(chartScope.key).toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
     }
 
     function getAreaLabel(nomination, aggregationMode) {
-      const city = nomination.city || "Unknown City";
+      if (aggregationMode === "osm") {
+        if (nomination.lat != null && nomination.lng != null) {
+          const cached = osmCacheGet(nomination.lat, nomination.lng);
+          if (cached) return cached;
+        }
+        // Not yet cached — group all pending into one hidden bucket
+        return "__OSM_PENDING__";
+      }
+
+      const city  = nomination.city  || "Unknown City";
       const state = nomination.state || "Unknown State";
 
-      if (aggregationMode === "state") {
-        return state;
-      }
+      if (aggregationMode === "state") return state;
       return `${city}, ${state}`;
     }
 
@@ -854,30 +1809,68 @@ function init() {
       return nomination.type === selectedType;
     }
 
-    function buildStackedAreaData(nominations) {
+    function buildStackedAreaData(nominations, chartScope) {
       const result = {};
+      const totalByArea = {}; // total submissions per area inside this chart's type scope
+
+      // Area date-range gate
+      let areaRangeStart = null, areaRangeEnd = null;
+      if (plotState.areaRangeEnabled && plotState.areaRangeStart && plotState.areaRangeEnd) {
+        areaRangeStart = new Date(plotState.areaRangeStart);
+        areaRangeEnd   = new Date(plotState.areaRangeEnd);
+        if (isNaN(areaRangeStart) || isNaN(areaRangeEnd) || areaRangeStart > areaRangeEnd) {
+          areaRangeStart = null; areaRangeEnd = null;
+        }
+      }
+
+      // Type/Status shared date-range gate
+      let tsRangeStart = null, tsRangeEnd = null;
+      if (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd) {
+        tsRangeStart = new Date(plotState.typeStatusRangeStart);
+        tsRangeEnd   = new Date(plotState.typeStatusRangeEnd);
+        if (isNaN(tsRangeStart) || isNaN(tsRangeEnd) || tsRangeStart > tsRangeEnd) {
+          tsRangeStart = null; tsRangeEnd = null;
+        }
+      }
 
       nominations.forEach(nomination => {
         if (!nomination) return;
-        if (!plotState.selectedStatuses.has(nomination.status)) return;
 
-        const typeMatch = Array.from(plotState.selectedTypes).some(type =>
-          nominationMatchesSelectedType(nomination, type)
-        );
+        if (!nominationMatchesChartScope(nomination, chartScope)) return;
 
-        if (!typeMatch) return;
+        // Apply type/status shared date range
+        if (tsRangeStart && tsRangeEnd) {
+          const dayKey = getDayKey(nomination);
+          if (dayKey === "Unknown") return;
+          const nomDate = new Date(dayKey);
+          if (nomDate < tsRangeStart || nomDate > tsRangeEnd) return;
+        }
+
+        // Apply area date range
+        if (areaRangeStart && areaRangeEnd) {
+          const dayKey = getDayKey(nomination);
+          if (dayKey === "Unknown") return;
+          const nomDate = new Date(dayKey);
+          if (nomDate < areaRangeStart || nomDate > areaRangeEnd) return;
+        }
 
         const area = getAreaLabel(nomination, plotState.aggregationMode);
 
-        if (!result[area]) {
-          result[area] = {};
-        }
+        // Track this chart's total per area across all statuses.
+        totalByArea[area] = (totalByArea[area] || 0) + 1;
 
-        if (!result[area][nomination.status]) {
-          result[area][nomination.status] = 0;
-        }
+        // Only count selected statuses for the stacked bar
+        if (!plotState.selectedStatuses.has(nomination.status)) return;
 
+        if (!result[area]) result[area] = {};
+        if (!result[area][nomination.status]) result[area][nomination.status] = 0;
         result[area][nomination.status] += 1;
+      });
+
+      // Attach total counts to each area entry so renderVerticalStackedBarChart can use them
+      Object.keys(totalByArea).forEach(area => {
+        if (!result[area]) result[area] = {};
+        result[area].__areaTotal__ = totalByArea[area];
       });
 
       return result;
@@ -885,17 +1878,21 @@ function init() {
 
 
     function getTopAreas(stackedData, maxBars = 20) {
+      const showAll = plotState.showAllSubmissionsArea;
       const rows = Object.entries(stackedData)
+        .filter(([area]) => area !== "__OSM_PENDING__")
         .map(([area, counts]) => {
-          const total = Object.values(counts).reduce((sum, val) => sum + val, 0);
-          return { area, counts, total };
+          const areaTotal = counts.__areaTotal__ || 0;
+          const total = Object.entries(counts)
+            .filter(([k]) => k !== "__areaTotal__")
+            .reduce((sum, [, val]) => sum + val, 0);
+          return { area, counts, total, areaTotal };
         })
-        .sort((a, b) => b.total - a.total);
+        // When showAll is on, include areas that have submissions even if selected total = 0
+        .filter(row => showAll ? row.areaTotal > 0 : row.total > 0)
+        .sort((a, b) => showAll ? b.areaTotal - a.areaTotal : b.total - a.total);
 
-      if (maxBars === "all") {
-        return rows;
-      }
-
+      if (maxBars === "all") return rows;
       return rows.slice(0, maxBars);
     }
 
@@ -911,14 +1908,58 @@ function init() {
       HELD: "#ffc107"
     };
 
-    function renderVerticalStackedBarChart(areaRows) {
+    function makeChartHeader(titleText, onExport) {
+      const header = document.createElement("div");
+      header.className = "wfns-chart-header";
+
+      const title = document.createElement("div");
+      title.textContent = titleText;
+      title.className = "wfns-chart-title";
+      header.appendChild(title);
+
+      if (onExport) {
+        const exportButton = document.createElement("button");
+        exportButton.type = "button";
+        exportButton.className = "wfns-chart-export-button";
+        exportButton.textContent = "PNG";
+        exportButton.title = "Download this chart as a PNG";
+        exportButton.addEventListener("click", onExport);
+        header.appendChild(exportButton);
+      }
+
+      return header;
+    }
+
+    function getAreaTitle(chartScope) {
+      return `All Areas, ${chartScope.titleLabel} by Area`;
+    }
+
+    function getTimelineTitlePrefix() {
+      return plotState.timelineMode === "cumulative"
+        ? "Cumulative Timeline"
+        : "Timeline";
+    }
+
+    function getTimelineAreaTitle() {
+      return plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
+        ? plotState.timelineAreaFilter
+        : "All Areas";
+    }
+
+    function renderVerticalStackedBarChart(areaRows, chartScope, append = false) {
       const chart = document.getElementById("wfns-plot-chart");
       if (!chart) return;
 
-      chart.innerHTML = "";
+      if (!append) chart.innerHTML = "";
 
       if (!areaRows.length) {
-        chart.textContent = "No nominations match the current filters.";
+        const empty = document.createElement("div");
+        empty.className = "wfns-chart-card";
+        empty.appendChild(makeChartHeader(`${getAreaTitle(chartScope)} - no data`, null));
+        const message = document.createElement("div");
+        message.textContent = "No submissions match the current filters.";
+        empty.appendChild(message);
+        chart.appendChild(empty);
         return;
       }
 
@@ -929,19 +1970,47 @@ function init() {
       const AREA_BAR_BG     = isDark ? "#2e2e2e" : "#f7f7f7";
       const AREA_BAR_BORDER = isDark ? "#555555" : "#bbb";
       const AREA_WRAP_BORDER = isDark ? "#3a3a3a" : "#ccc";
+      const BLANK_COLOR     = isDark ? "#3a3a3a" : "#e0e0e0"; // colour for unselected portion
 
-      const maxTotal = Math.max(...areaRows.map(row => row.total));
+      const showAll = plotState.showAllSubmissionsArea;
+
+      // When showAll is on, scale bars relative to the area's grand total; otherwise selected total
+      const maxTotal = showAll
+        ? Math.max(...areaRows.map(row => row.areaTotal || row.total))
+        : Math.max(...areaRows.map(row => row.total));
 
       const outer = document.createElement("div");
       outer.className = "wfns-chart-card";
 
-      const title = document.createElement("div");
-      title.textContent = "Nominations by Area";
-      title.className = "wfns-chart-title";
-      outer.appendChild(title);
+      // Update area range info hint
+      const areaRangeInfoEl = document.getElementById("wfns-area-range-info");
+      const tsRangeInfoEl   = document.getElementById("wfns-ts-range-info");
+      const _updateRangeInfoEl = (el, enabled, start, end) => {
+        if (!el) return;
+        if (enabled && start && end) {
+          const s = new Date(start), e = new Date(end);
+          if (!isNaN(s) && !isNaN(e) && s <= e) {
+            const g = computeRangeGranularity(s, e);
+            el.textContent = g.granularity === "day"
+              ? `Day view — ${g.totalDays} days`
+              : `Month view — ${g.totalDays} days span`;
+          } else { el.textContent = ""; }
+        } else { el.textContent = ""; }
+      };
+      _updateRangeInfoEl(areaRangeInfoEl, plotState.areaRangeEnabled, plotState.areaRangeStart, plotState.areaRangeEnd);
+      _updateRangeInfoEl(tsRangeInfoEl, plotState.typeStatusRangeEnabled, plotState.typeStatusRangeStart, plotState.typeStatusRangeEnd);
+
+      const areaDateRangeText = (plotState.areaRangeEnabled && plotState.areaRangeStart && plotState.areaRangeEnd)
+        ? ` [${plotState.areaRangeStart} → ${plotState.areaRangeEnd}]` : "";
+      const tsDateRangeText = (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd)
+        ? ` [${plotState.typeStatusRangeStart} → ${plotState.typeStatusRangeEnd}]` : "";
+      outer.appendChild(makeChartHeader(
+        `${getAreaTitle(chartScope)}${areaDateRangeText}${tsDateRangeText}`,
+        () => exportAreaPlotAsPng(outer, chartScope)
+      ));
 
       const barsWrap = document.createElement("div");
-      barsWrap.id = "wfns-bars-wrap";
+      barsWrap.className = "wfns-bars-wrap";
       barsWrap.style.cssText = `
         display: flex;
         align-items: flex-end;
@@ -953,6 +2022,13 @@ function init() {
       `;
 
       areaRows.forEach(row => {
+        const denominator = showAll ? (row.areaTotal || row.total) : row.total;
+        const scaledHeight = maxTotal > 0 ? (denominator / maxTotal) * 220 : 0;
+        const selectedHeight = (denominator > 0 && showAll)
+          ? (row.total / denominator) * scaledHeight
+          : scaledHeight;
+        const blankHeight = scaledHeight - selectedHeight;
+
         const col = document.createElement("div");
         col.style.cssText = `
           display: flex;
@@ -966,10 +2042,13 @@ function init() {
           box-sizing: border-box;
         `;
 
+        // Show selected count / total if showAll, else just selected total
         const totalLabel = document.createElement("div");
-        totalLabel.textContent = row.total;
+        totalLabel.textContent = showAll
+          ? `${row.total}/${row.areaTotal || row.total}`
+          : row.total;
         totalLabel.style.cssText = `
-          font-size: 12px;
+          font-size: ${showAll ? "10px" : "12px"};
           margin-bottom: 6px;
           color: ${AREA_TEXT};
         `;
@@ -987,8 +2066,6 @@ function init() {
           overflow: hidden;
         `;
 
-        const scaledHeight = maxTotal > 0 ? (row.total / maxTotal) * 220 : 0;
-
         const barInner = document.createElement("div");
         barInner.style.cssText = `
           width: 100%;
@@ -1003,7 +2080,9 @@ function init() {
 
         statusesInBar.forEach(status => {
           const segment = document.createElement("div");
-          const segHeight = (row.counts[status] / row.total) * scaledHeight;
+          const segHeight = denominator > 0
+            ? (row.counts[status] / denominator) * scaledHeight
+            : 0;
           segment.style.width = "100%";
           segment.style.height = `${segHeight}px`;
           segment.style.background = STATUS_COLORS[status] || "#888";
@@ -1032,6 +2111,36 @@ function init() {
 
           barInner.appendChild(segment);
         });
+
+        // Blank remainder segment (top of bar, shown in column-reverse so renders above selected)
+        if (showAll && blankHeight > 0) {
+          const blankSeg = document.createElement("div");
+          blankSeg.style.width = "100%";
+          blankSeg.style.height = `${blankHeight}px`;
+          blankSeg.style.background = BLANK_COLOR;
+          blankSeg.style.position = "relative";
+          const unselected = (row.areaTotal || row.total) - row.total;
+          blankSeg.title = `${row.area} | Unselected statuses: ${unselected}`;
+
+          if (plotState.showDataLabels && blankHeight >= 14 && unselected > 0) {
+            const numLabel = document.createElement("span");
+            numLabel.textContent = unselected;
+            numLabel.style.cssText = `
+              position: absolute;
+              top: 50%;
+              left: 50%;
+              transform: translate(-50%, -50%);
+              font-size: 10px;
+              color: ${isDark ? "#aaa" : "#555"};
+              font-weight: 700;
+              white-space: nowrap;
+              pointer-events: none;
+              line-height: 1;
+            `;
+            blankSeg.appendChild(numLabel);
+          }
+          barInner.appendChild(blankSeg);
+        }
 
         barOuter.appendChild(barInner);
 
@@ -1080,6 +2189,16 @@ function init() {
         legend.appendChild(item);
       });
 
+      if (showAll) {
+        const blankItem = document.createElement("div");
+        blankItem.className = "wfns-legend-item";
+        blankItem.innerHTML = `
+          <span style="display:inline-block;width:12px;height:12px;background:${BLANK_COLOR};border-radius:2px;border:1px solid ${AREA_BAR_BORDER};"></span>
+          <span>Unselected (all submissions)</span>
+        `;
+        legend.appendChild(blankItem);
+      }
+
       outer.appendChild(legend);
       chart.appendChild(outer);
     }
@@ -1096,29 +2215,94 @@ function init() {
       return `${year}-${month}`;
     }
 
+    function getDayKey(nomination) {
+      const dateStr = nomination.day || nomination.lastUpdateTime || nomination.imageImportedAt;
+      if (!dateStr) return "Unknown";
+      const d = new Date(dateStr);
+      if (isNaN(d)) return "Unknown";
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    }
+
+    function buildContinuousDayRange(minDay, maxDay) {
+      const days = [];
+      if (!minDay || !maxDay) return days;
+      const cur = new Date(minDay);
+      const end = new Date(maxDay);
+      while (cur <= end) {
+        const y = cur.getFullYear();
+        const m = String(cur.getMonth() + 1).padStart(2, "0");
+        const d = String(cur.getDate()).padStart(2, "0");
+        days.push(`${y}-${m}-${d}`);
+        cur.setDate(cur.getDate() + 1);
+      }
+      return days;
+    }
+
+    // Returns the granularity descriptor when a date range is active.
+    //   granularity "day" subMode "every"    → every single day  (< 30 days)
+    //   granularity "day" subMode "midrange" → 1/10/20/last-of-month (30–149 days)
+    //   granularity "month"                  → monthly ticks (>= 150 days)
+    function computeRangeGranularity(startDate, endDate) {
+      const msPerDay = 86400000;
+      const totalDays = Math.round((endDate - startDate) / msPerDay) + 1;
+      if (totalDays < 30)  return { granularity: "day", subMode: "every",    totalDays };
+      if (totalDays < 150) return { granularity: "day", subMode: "midrange", totalDays };
+      return { granularity: "month", totalDays };
+    }
+
+    // Days in the month that contains dayKey ("YYYY-MM-DD").
+    function daysInMonthForKey(dayKey) {
+      const [y, m] = dayKey.split("-").map(Number);
+      return new Date(y, m, 0).getDate();
+    }
+
+    // True when day dd (1-based) should get a label in midrange mode.
+    // Rule: 1, 10, 20, last day of month — but skip 30 when the month has 31 days.
+    function isMidrangeLabelDay(dd, daysInMonth) {
+      if (dd === 1 || dd === 10 || dd === 20) return true;
+      if (dd === daysInMonth && !(daysInMonth === 31 && dd === 30)) return true;
+      return false;
+    }
+
     function buildContinuousMonthRange(minMonth, maxMonth) {
       const months = [];
       if (!minMonth || !maxMonth) return months;
-
       let [year, month] = minMonth.split("-").map(Number);
       const [maxYear, maxMonthNum] = maxMonth.split("-").map(Number);
-
       while (year < maxYear || (year === maxYear && month <= maxMonthNum)) {
         months.push(`${year}-${String(month).padStart(2, "0")}`);
         month += 1;
-        if (month > 12) {
-          month = 1;
-          year += 1;
-        }
+        if (month > 12) { month = 1; year += 1; }
       }
-
       return months;
     }
 
-    function buildTimelineLineData(nominations) {
-      const observedMonths = [];
+    function buildTimelineLineData(nominations, chartScope) {
+      const useRange = plotState.timelineRangeEnabled &&
+                       plotState.timelineRangeStart &&
+                       plotState.timelineRangeEnd;
+
+      let rangeStart = null, rangeEnd = null, rangeInfo = null;
+      if (useRange) {
+        rangeStart = new Date(plotState.timelineRangeStart);
+        rangeEnd   = new Date(plotState.timelineRangeEnd);
+        if (isNaN(rangeStart) || isNaN(rangeEnd) || rangeStart > rangeEnd) {
+          // invalid range — fall back to no filter
+          rangeStart = null; rangeEnd = null;
+        } else {
+          rangeInfo = computeRangeGranularity(rangeStart, rangeEnd);
+        }
+      }
+
+      const isDayMode = rangeInfo && rangeInfo.granularity === "day";
+
+      // Bucket keys are either "YYYY-MM-DD" (day mode) or "YYYY-MM" (month mode)
+      const observedKeys = [];
       const countsByStatus = {};
-      const countsByMonthAll = {}; // total submissions regardless of status
+      const countsByKeyAll = {};
 
       PLOT_STATUS_TYPES.forEach(status => {
         if (plotState.selectedStatuses.has(status)) {
@@ -1129,156 +2313,252 @@ function init() {
       nominations.forEach(nomination => {
         if (!nomination) return;
 
-        const typeMatch = Array.from(plotState.selectedTypes).some(type =>
-          nominationMatchesSelectedType(nomination, type)
-        );
-        if (!typeMatch) return;
+        if (!nominationMatchesChartScope(nomination, chartScope)) return;
 
         const area = getAreaLabel(nomination, plotState.aggregationMode);
         if (
           plotState.timelineAreaFilter &&
-          plotState.timelineAreaFilter !== "__ALL__" &&
-          area !== plotState.timelineAreaFilter
+          plotState.timelineAreaFilter !== "__ALL__"
         ) {
-          return;
+          // In province-only mode, match nominations whose label's province part equals the filter
+          if (plotState.timelineAreaProvinceOnly) {
+            const parts = area.split(",").map(s => s.trim()).filter(Boolean);
+            const provinceLabel = parts.slice(parts.length >= 3 ? 1 : 0).join(", ");
+            if (provinceLabel !== plotState.timelineAreaFilter) return;
+          } else {
+            if (area !== plotState.timelineAreaFilter) return;
+          }
         }
 
-        const month = getMonthKey(nomination);
-        if (!month || month === "Unknown") return;
+        // Type/Status shared date-range gate
+        if (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd) {
+          const ts0 = new Date(plotState.typeStatusRangeStart);
+          const ts1 = new Date(plotState.typeStatusRangeEnd);
+          if (!isNaN(ts0) && !isNaN(ts1) && ts0 <= ts1) {
+            const dayKey = getDayKey(nomination);
+            if (dayKey === "Unknown") return;
+            const nomDate = new Date(dayKey);
+            if (nomDate < ts0 || nomDate > ts1) return;
+          }
+        }
 
-        observedMonths.push(month);
+        // Timeline date-range gate
+        if (rangeStart && rangeEnd) {
+          const dayKey = getDayKey(nomination);
+          if (dayKey === "Unknown") return;
+          const nomDate = new Date(dayKey);
+          if (nomDate < rangeStart || nomDate > rangeEnd) return;
+        }
 
-        // "All submissions" counter — ignores status filter
-        countsByMonthAll[month] = (countsByMonthAll[month] || 0) + 1;
+        const bucketKey = isDayMode ? getDayKey(nomination) : getMonthKey(nomination);
+        if (!bucketKey || bucketKey === "Unknown") return;
 
-        // Per-status counters — only for selected statuses
+        // Track all statuses inside this chart's type scope.
+        observedKeys.push(bucketKey);
+        countsByKeyAll[bucketKey] = (countsByKeyAll[bucketKey] || 0) + 1;
+
         if (!plotState.selectedStatuses.has(nomination.status)) return;
-        if (!countsByStatus[nomination.status]) {
-          countsByStatus[nomination.status] = {};
-        }
-        countsByStatus[nomination.status][month] =
-          (countsByStatus[nomination.status][month] || 0) + 1;
+        if (!countsByStatus[nomination.status]) countsByStatus[nomination.status] = {};
+        countsByStatus[nomination.status][bucketKey] =
+          (countsByStatus[nomination.status][bucketKey] || 0) + 1;
       });
 
-      if (!observedMonths.length) {
-        return { months: [], series: [] };
+      if (!observedKeys.length) {
+        return { ticks: [], series: [], allSeries: null, rangeInfo, isDayMode };
       }
 
-      observedMonths.sort();
-      const minMonth = observedMonths[0];
-      const maxMonth = observedMonths[observedMonths.length - 1];
-      const months = buildContinuousMonthRange(minMonth, maxMonth);
+      observedKeys.sort();
+      const minKey = observedKeys[0];
+      const maxKey = observedKeys[observedKeys.length - 1];
+
+      // When a date range is active, always span from the range boundaries so
+      // days/months with zero counts (e.g. the tail of February) are still shown.
+      let tickMin, tickMax;
+      if (useRange && rangeStart && rangeEnd) {
+        if (isDayMode) {
+          const pad = d => {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, "0");
+            const dy = String(d.getDate()).padStart(2, "0");
+            return `${y}-${m}-${dy}`;
+          };
+          tickMin = pad(rangeStart);
+          tickMax = pad(rangeEnd);
+        } else {
+          const padM = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+          tickMin = padM(rangeStart);
+          tickMax = padM(rangeEnd);
+        }
+      } else {
+        tickMin = minKey;
+        tickMax = maxKey;
+      }
+
+      // Build the full continuous tick list
+      const ticks = isDayMode
+        ? buildContinuousDayRange(tickMin, tickMax)
+        : buildContinuousMonthRange(tickMin, tickMax);
 
       let series = Object.keys(countsByStatus).map(status => ({
         key: status,
         label: STATUS_DISPLAY[status] || status,
-        values: months.map(month => ({
-          month,
-          count: countsByStatus[status][month] || 0
-        }))
+        values: ticks.map(t => ({ tick: t, count: countsByStatus[status][t] || 0 }))
       }));
 
       if (plotState.timelineMode === "cumulative") {
-        series = makeSeriesCumulative(series);
+        series = makeSeriesCumulativeTicks(series);
       }
 
-      // Build "All Submissions" series if toggled on
       let allSeries = null;
       if (plotState.showAllSubmissions) {
         allSeries = {
           key: "__ALL__",
           label: "All Submissions",
-          values: months.map(month => ({
-            month,
-            count: countsByMonthAll[month] || 0
-          }))
+          values: ticks.map(t => ({ tick: t, count: countsByKeyAll[t] || 0 }))
         };
         if (plotState.timelineMode === "cumulative") {
-          allSeries = makeSeriesCumulative([allSeries])[0];
+          allSeries = makeSeriesCumulativeTicks([allSeries])[0];
         }
       }
 
-      return { months, series, allSeries };
+      return { ticks, series, allSeries, rangeInfo, isDayMode };
     }
 
-    function renderTimelineChart(timelineData) {
+    function renderTimelineChart(timelineData, chartScope, append = false) {
       const chart = document.getElementById("wfns-timeline-chart");
       if (!chart) return;
+      if (!append) chart.innerHTML = "";
 
-      chart.innerHTML = "";
+      const { ticks, series, allSeries, rangeInfo, isDayMode } = timelineData;
 
-      const { months, series, allSeries } = timelineData;
-
-      if (!months.length || !series.length) {
-        chart.textContent = "No timeline data for selected filters.";
+      if (!ticks || !ticks.length || (!series.length && !allSeries)) {
+        const empty = document.createElement("div");
+        empty.className = "wfns-chart-card";
+        empty.appendChild(makeChartHeader(`${getTimelineTitlePrefix()} - ${getTimelineAreaTitle()}, ${chartScope.titleLabel} - no data`, null));
+        const message = document.createElement("div");
+        message.textContent = "No timeline data for selected filters.";
+        empty.appendChild(message);
+        chart.appendChild(empty);
         return;
       }
 
-      // Detect dark mode via the .dark class on <body> or <html>
+      // Update the range info hint in the control
+      const rangeInfoEl = document.getElementById("wfns-range-info");
+      if (rangeInfoEl && rangeInfo) {
+        const modeLabel = rangeInfo.granularity === "day"
+          ? `Day view — tick every ${rangeInfo.tickEvery} day(s) — ${rangeInfo.totalDays} days total`
+          : `Month view — ${rangeInfo.totalDays} days span`;
+        rangeInfoEl.textContent = modeLabel;
+      } else if (rangeInfoEl) {
+        rangeInfoEl.textContent = "";
+      }
+      // Update ts-range-info (also shown in Type/Status section)
+      const tsRangeInfoEl2 = document.getElementById("wfns-ts-range-info");
+      if (tsRangeInfoEl2) {
+        if (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd) {
+          const s2 = new Date(plotState.typeStatusRangeStart), e2 = new Date(plotState.typeStatusRangeEnd);
+          if (!isNaN(s2) && !isNaN(e2) && s2 <= e2) {
+            const g2 = computeRangeGranularity(s2, e2);
+            tsRangeInfoEl2.textContent = g2.granularity === "day"
+              ? `Day view — ${g2.totalDays} days`
+              : `Month view — ${g2.totalDays} days span`;
+          } else { tsRangeInfoEl2.textContent = ""; }
+        } else { tsRangeInfoEl2.textContent = ""; }
+      }
+
       const isDark = document.body.classList.contains("dark") ||
                      document.documentElement.classList.contains("dark");
+      const COLOR_AXIS  = isDark ? "#cccccc" : "#333333";
+      const COLOR_GRID  = isDark ? "#3a3a3a" : "#dddddd";
+      const COLOR_TEXT  = isDark ? "#e8e8e8" : "#000000";
+      const COLOR_MUTED = isDark ? "#aaaaaa" : "#555555";
+      const COLOR_BG    = isDark ? "#242424" : "#ffffff";
+      const ALL_COLOR   = isDark ? "#f0b429" : "#e67e00";
 
-      const COLOR_AXIS   = isDark ? "#cccccc" : "#333333";
-      const COLOR_GRID   = isDark ? "#3a3a3a" : "#dddddd";
-      const COLOR_TEXT   = isDark ? "#e8e8e8" : "#000000";
-      const COLOR_MUTED  = isDark ? "#aaaaaa" : "#555555";
-      const COLOR_BG     = isDark ? "#242424" : "#ffffff";
-      const COLOR_BORDER = isDark ? "#3a3a3a" : "#dddddd";
-      const ALL_COLOR    = isDark ? "#f0b429" : "#e67e00"; // amber for "all submissions"
+      const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
       const outer = document.createElement("div");
       outer.className = "wfns-chart-card";
 
-      const titleEl = document.createElement("div");
-      titleEl.className = "wfns-chart-title";
-      const areaText =
-        plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
-          ? ` (${plotState.timelineAreaFilter})`
-          : " (All areas)";
-      const modeText = plotState.timelineMode === "cumulative" ? "Cumulative Nominations Over Time" : "Nominations Over Time";
-      titleEl.textContent = `${modeText}${areaText}`;
-      outer.appendChild(titleEl);
+      const timelineTitleBase = `${getTimelineTitlePrefix()} - ${getTimelineAreaTitle()}, ${chartScope.titleLabel}`;
+      const rangeText = (plotState.timelineRangeEnabled && plotState.timelineRangeStart && plotState.timelineRangeEnd)
+        ? ` [${plotState.timelineRangeStart} → ${plotState.timelineRangeEnd}]` : "";
+      const tsRangeText = (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd)
+        ? ` [${plotState.typeStatusRangeStart} → ${plotState.typeStatusRangeEnd}]` : "";
+      outer.appendChild(makeChartHeader(
+        `${timelineTitleBase}${rangeText}${tsRangeText}`,
+        () => exportTimelinePlotAsPng(outer, chartScope)
+      ));
 
-      // Include allSeries in Y-scale calculation
+      // ── Y-scale ──
       const allSeriesValues = allSeries ? allSeries.values.map(v => v.count) : [];
-      const rawMaxY = Math.max(
-        1,
-        ...series.flatMap(s => s.values.map(v => v.count)),
-        ...allSeriesValues
-      );
+      const rawMaxY = Math.max(1, ...series.flatMap(s => s.values.map(v => v.count)), ...allSeriesValues);
       const yStep = getNiceStep(rawMaxY);
       const maxY  = getNiceAxisMax(rawMaxY);
 
-      // Responsive: use container width, fall back to 700 minimum
-      const containerWidth = chart.clientWidth || 700;
-      const width  = containerWidth;
-      const height = 440;
-      const margin = { top: 60, right: 60, bottom: 80, left: 70 };
-      const xPadLeft  = 30;
-      // Month axis spans 9/10 of the available inner width; the remaining 1/10 gives
-      // room for the arrowhead and the last tick label to never be clipped.
-      const totalInnerWidth = width - margin.left - margin.right - xPadLeft;
-      const innerWidth  = Math.floor(totalInnerWidth * 0.9);
+      // ── Layout ──
+      const margin      = { top: 60, right: 60, bottom: 80, left: 70 };
+      const xPadLeft    = 30;
+      const height      = 440;
       const innerHeight = height - margin.top - margin.bottom;
+      const axisExtend  = 14;
+      const isScrollable = plotState.timelineViewMode === "scrollable";
 
+      let svgWidth, xStepSize;
+
+      if (isDayMode) {
+        // Day granularity: each tick is a day; fixed or responsive
+        const tickEvery  = rangeInfo ? rangeInfo.tickEvery : 1;
+        // xStepSize is always pixels-per-day; tickEvery only controls label density
+        if (isScrollable) {
+          xStepSize = 28; // 28px per day regardless of label density
+          svgWidth  = margin.left + xPadLeft + (ticks.length - 1) * xStepSize
+                      + margin.right + xPadLeft;
+          svgWidth  = Math.max(svgWidth, 400);
+        } else {
+          const containerWidth = chart.clientWidth || 700;
+          svgWidth  = containerWidth;
+          const totalInner = svgWidth - margin.left - margin.right - xPadLeft;
+          const innerData  = Math.floor(totalInner * 0.9);
+          xStepSize = ticks.length > 1 ? innerData / (ticks.length - 1) : 0;
+        }
+      } else {
+        // Month granularity (same as before)
+        if (isScrollable) {
+          xStepSize = 28;
+          svgWidth  = margin.left + xPadLeft + (ticks.length - 1) * xStepSize
+                      + margin.right + xPadLeft;
+          svgWidth  = Math.max(svgWidth, 400);
+        } else {
+          const containerWidth = chart.clientWidth || 700;
+          svgWidth  = containerWidth;
+          const totalInner = svgWidth - margin.left - margin.right - xPadLeft;
+          const innerData  = Math.floor(totalInner * 0.9);
+          xStepSize = ticks.length > 1 ? innerData / (ticks.length - 1) : 0;
+        }
+      }
+
+      const innerWidth = ticks.length > 1
+        ? (ticks.length - 1) * xStepSize
+        : xStepSize;
+
+      const getX = (i) => margin.left + xPadLeft + i * xStepSize;
+      const getY = (v) => margin.top + innerHeight - (v / maxY) * innerHeight;
+
+      // ── SVG ──
       const svgNS = "http://www.w3.org/2000/svg";
       const svg = document.createElementNS(svgNS, "svg");
-      svg.setAttribute("width", width);
+      svg.setAttribute("width", svgWidth);
       svg.setAttribute("height", height + 30);
-      svg.style.cssText = `display:block; background:${COLOR_BG}; width:100%;`;
+      svg.style.cssText = `display:block; background:${COLOR_BG};`;
+      if (!isScrollable) svg.style.width = "100%";
 
-      const xStep = months.length > 1 ? innerWidth / (months.length - 1) : 0;
-      const getX  = (i) => margin.left + xPadLeft + (months.length > 1 ? i * xStep : innerWidth / 2);
-      const getY  = (v) => margin.top + innerHeight - (v / maxY) * innerHeight;
-
-      // ── Arrowhead marker ──
+      // ── Arrow marker ──
       const defs   = document.createElementNS(svgNS, "defs");
       const marker = document.createElementNS(svgNS, "marker");
       marker.setAttribute("id", "wfns-arrow");
-      marker.setAttribute("markerWidth", "8");
-      marker.setAttribute("markerHeight", "8");
-      marker.setAttribute("refX", "6");
-      marker.setAttribute("refY", "3");
+      marker.setAttribute("markerWidth", "8"); marker.setAttribute("markerHeight", "8");
+      marker.setAttribute("refX", "6");        marker.setAttribute("refY", "3");
       marker.setAttribute("orient", "auto");
       const arrowPath = document.createElementNS(svgNS, "path");
       arrowPath.setAttribute("d", "M0,0 L0,6 L8,3 z");
@@ -1287,35 +2567,26 @@ function init() {
       defs.appendChild(marker);
       svg.appendChild(defs);
 
-      const axisExtend = 14;
-
-      // X-axis — extend 10% more than innerWidth so the arrow clears the last label
-      const xAxisEnd = margin.left + xPadLeft + innerWidth + Math.floor(totalInnerWidth * 0.1) - 4;
+      // ── Axes ──
+      const xAxisEnd = margin.left + xPadLeft + innerWidth +
+        (isScrollable ? 20 : Math.floor((svgWidth - margin.left - margin.right - xPadLeft) * 0.1));
       const xAxis = document.createElementNS(svgNS, "line");
-      xAxis.setAttribute("x1", margin.left);
-      xAxis.setAttribute("y1", margin.top + innerHeight);
-      xAxis.setAttribute("x2", xAxisEnd);
-      xAxis.setAttribute("y2", margin.top + innerHeight);
-      xAxis.setAttribute("stroke", COLOR_AXIS);
-      xAxis.setAttribute("stroke-width", "1.5");
+      xAxis.setAttribute("x1", margin.left); xAxis.setAttribute("y1", margin.top + innerHeight);
+      xAxis.setAttribute("x2", xAxisEnd);    xAxis.setAttribute("y2", margin.top + innerHeight);
+      xAxis.setAttribute("stroke", COLOR_AXIS); xAxis.setAttribute("stroke-width", "1.5");
       xAxis.setAttribute("marker-end", "url(#wfns-arrow)");
       svg.appendChild(xAxis);
 
-      // Y-axis
       const yAxis = document.createElementNS(svgNS, "line");
-      yAxis.setAttribute("x1", margin.left);
-      yAxis.setAttribute("y1", margin.top + innerHeight);
-      yAxis.setAttribute("x2", margin.left);
-      yAxis.setAttribute("y2", margin.top - axisExtend);
-      yAxis.setAttribute("stroke", COLOR_AXIS);
-      yAxis.setAttribute("stroke-width", "1.5");
+      yAxis.setAttribute("x1", margin.left); yAxis.setAttribute("y1", margin.top + innerHeight);
+      yAxis.setAttribute("x2", margin.left); yAxis.setAttribute("y2", margin.top - axisExtend);
+      yAxis.setAttribute("stroke", COLOR_AXIS); yAxis.setAttribute("stroke-width", "1.5");
       yAxis.setAttribute("marker-end", "url(#wfns-arrow)");
       svg.appendChild(yAxis);
 
-      // ── Y-axis ticks, grid, labels ──
+      // ── Y ticks + grid ──
       for (let value = 0; value <= maxY; value += yStep) {
         const y = getY(value);
-
         const tick = document.createElementNS(svgNS, "line");
         tick.setAttribute("x1", margin.left - 5); tick.setAttribute("y1", y);
         tick.setAttribute("x2", margin.left);      tick.setAttribute("y2", y);
@@ -1323,100 +2594,204 @@ function init() {
         svg.appendChild(tick);
 
         const grid = document.createElementNS(svgNS, "line");
-        grid.setAttribute("x1", margin.left); grid.setAttribute("y1", y);
+        grid.setAttribute("x1", margin.left);                    grid.setAttribute("y1", y);
         grid.setAttribute("x2", margin.left + xPadLeft + innerWidth); grid.setAttribute("y2", y);
-        grid.setAttribute("stroke", COLOR_GRID);
-        grid.setAttribute("stroke-dasharray", "2,2");
+        grid.setAttribute("stroke", COLOR_GRID); grid.setAttribute("stroke-dasharray", "2,2");
         svg.appendChild(grid);
 
-        const label = document.createElementNS(svgNS, "text");
-        label.setAttribute("x", margin.left - 8);
-        label.setAttribute("y", y + 4);
-        label.setAttribute("text-anchor", "end");
-        label.setAttribute("font-size", "11");
-        label.setAttribute("fill", COLOR_TEXT);
-        label.textContent = value;
-        svg.appendChild(label);
+        const lbl = document.createElementNS(svgNS, "text");
+        lbl.setAttribute("x", margin.left - 8); lbl.setAttribute("y", y + 4);
+        lbl.setAttribute("text-anchor", "end"); lbl.setAttribute("font-size", "11");
+        lbl.setAttribute("fill", COLOR_TEXT);
+        lbl.textContent = value;
+        svg.appendChild(lbl);
       }
 
-      // Y-axis title
+      // Y title
       const yTitle = document.createElementNS(svgNS, "text");
       yTitle.setAttribute("x", 14);
       yTitle.setAttribute("y", margin.top + innerHeight / 2);
-      yTitle.setAttribute("text-anchor", "middle");
-      yTitle.setAttribute("font-size", "12");
+      yTitle.setAttribute("text-anchor", "middle"); yTitle.setAttribute("font-size", "12");
       yTitle.setAttribute("fill", COLOR_TEXT);
       yTitle.setAttribute("transform", `rotate(-90 14 ${margin.top + innerHeight / 2})`);
       yTitle.textContent = "Count";
       svg.appendChild(yTitle);
 
-      // ── X-axis: month abbreviations + year brackets ──
-      const MONTH_ABBR = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-
-      const yearGroups = {};
-      months.forEach((month, i) => {
-        const [year] = month.split("-");
-        if (!yearGroups[year]) yearGroups[year] = { start: i, end: i };
-        yearGroups[year].end = i;
-      });
-
-      months.forEach((month, i) => {
-        const x = getX(i);
-        const [, monthNum] = month.split("-");
-        const mIdx = parseInt(monthNum, 10) - 1;
-
-        const tick = document.createElementNS(svgNS, "line");
-        tick.setAttribute("x1", x); tick.setAttribute("y1", margin.top + innerHeight);
-        tick.setAttribute("x2", x); tick.setAttribute("y2", margin.top + innerHeight + 4);
-        tick.setAttribute("stroke", COLOR_AXIS);
-        svg.appendChild(tick);
-
-        const label = document.createElementNS(svgNS, "text");
-        label.setAttribute("x", x);
-        label.setAttribute("y", margin.top + innerHeight + 15);
-        label.setAttribute("text-anchor", "middle");
-        label.setAttribute("font-size", "10");
-        label.setAttribute("fill", COLOR_TEXT);
-        label.textContent = MONTH_ABBR[mIdx];
-        svg.appendChild(label);
-      });
-
+      // ── X-axis ticks + labels ──
       const bracketY   = margin.top + innerHeight + 28;
       const yearLabelY = bracketY + 24;
 
-      Object.entries(yearGroups).forEach(([year, { start, end }]) => {
-        const xStart = getX(start);
-        const xEnd   = getX(end);
-        const midX   = (xStart + xEnd) / 2;
-        const bBot   = bracketY + 10;
+      if (isDayMode) {
+        // Determine which subMode applies (falls back to "every" if no rangeInfo)
+        const daySubMode = rangeInfo ? rangeInfo.subMode : "every";
+        const monthGroups = {};
 
-        [[xStart, bracketY, xStart, bBot],
-         [xStart, bBot,     xEnd,   bBot],
-         [xEnd,   bracketY, xEnd,   bBot]].forEach(([x1,y1,x2,y2]) => {
-          const l = document.createElementNS(svgNS, "line");
-          l.setAttribute("x1",x1); l.setAttribute("y1",y1);
-          l.setAttribute("x2",x2); l.setAttribute("y2",y2);
-          l.setAttribute("stroke", COLOR_MUTED); l.setAttribute("stroke-width","1");
-          svg.appendChild(l);
+        ticks.forEach((dayKey, i) => {
+          const [year, mm, dd] = dayKey.split("-");
+          const ddNum = parseInt(dd, 10);
+          const monthKey = `${year}-${mm}`;
+          if (!monthGroups[monthKey]) monthGroups[monthKey] = { start: i, end: i, year, mm };
+          monthGroups[monthKey].end = i;
+
+          const x = getX(i);
+          const isLastTick   = i === ticks.length - 1;
+          const dimInMonth   = daysInMonthForKey(dayKey);
+
+          const isFirstTick  = i === 0;
+          const isFirstOfMonth = ddNum === 1;
+          const isLastOfMonth  = ddNum === dimInMonth;
+
+          // Decide whether this day should be labelled
+          let shouldLabel;
+          if (isLastTick || isFirstTick) {
+            shouldLabel = true; // always mark first and last date of the chart
+          } else if (daySubMode === "every") {
+            shouldLabel = true; // < 30 days: every day
+          } else {
+            // midrange: 1 / 10 / 20 / last-of-month (skip day-30 in 31-day months)
+            shouldLabel = isMidrangeLabelDay(ddNum, dimInMonth);
+          }
+
+          // Tick mark — taller and darker on labelled days
+          const tickEl = document.createElementNS(svgNS, "line");
+          tickEl.setAttribute("x1", x); tickEl.setAttribute("y1", margin.top + innerHeight);
+          tickEl.setAttribute("x2", x); tickEl.setAttribute("y2", margin.top + innerHeight + (shouldLabel ? 6 : 3));
+          tickEl.setAttribute("stroke", shouldLabel ? COLOR_AXIS : COLOR_MUTED);
+          tickEl.setAttribute("stroke-width", shouldLabel ? "1.2" : "0.7");
+          svg.appendChild(tickEl);
+
+          if (shouldLabel) {
+            const lbl = document.createElementNS(svgNS, "text");
+            lbl.setAttribute("x", x); lbl.setAttribute("y", margin.top + innerHeight + 15);
+            // Anchor logic to prevent label collisions at month boundaries:
+            //   • first tick of chart   → "start"  (leans right, no left overflow)
+            //   • last tick of chart    → "end"    (leans left, no right overflow)
+            //   • first day of a month  → "start"  (leans right, away from prev-month last-day label)
+            //   • last day of a month   → "end"    (leans left, away from next-month first-day label)
+            //   • everything else       → "middle"
+            let anchor;
+            if (isFirstTick) {
+              anchor = "end";
+            } else if (isLastTick) {
+              anchor = "start";
+            } else if (isFirstOfMonth) {
+              anchor = "start";
+            } else if (isLastOfMonth) {
+              anchor = "end";
+            } else {
+              anchor = "middle";
+            }
+            lbl.setAttribute("text-anchor", anchor);
+            lbl.setAttribute("font-size", "9");
+            lbl.setAttribute("fill", (isFirstTick || isLastTick) ? COLOR_AXIS : COLOR_TEXT);
+            lbl.setAttribute("font-weight", (isFirstTick || isLastTick) ? "700" : "400");
+            lbl.textContent = dd;
+            svg.appendChild(lbl);
+          }
         });
 
-        const yearText = document.createElementNS(svgNS, "text");
-        yearText.setAttribute("x", midX);
-        yearText.setAttribute("y", yearLabelY);
-        yearText.setAttribute("text-anchor", "middle");
-        yearText.setAttribute("font-size", "11");
-        yearText.setAttribute("font-weight", "600");
-        yearText.setAttribute("fill", COLOR_TEXT);
-        yearText.textContent = year;
-        svg.appendChild(yearText);
-      });
+        // Month brackets (replaces year brackets in day mode)
+        Object.entries(monthGroups).forEach(([monthKey, { start, end, year, mm }]) => {
+          const xStart = getX(start);
+          const xEnd   = getX(end);
+          const midX   = (xStart + xEnd) / 2;
+          const bBot   = bracketY + 10;
+          const mIdx   = parseInt(mm, 10) - 1;
+
+          [[xStart, bracketY, xStart, bBot],
+           [xStart, bBot,     xEnd,   bBot],
+           [xEnd,   bracketY, xEnd,   bBot]].forEach(([x1, y1, x2, y2]) => {
+            const l = document.createElementNS(svgNS, "line");
+            l.setAttribute("x1", x1); l.setAttribute("y1", y1);
+            l.setAttribute("x2", x2); l.setAttribute("y2", y2);
+            l.setAttribute("stroke", COLOR_MUTED); l.setAttribute("stroke-width", "1");
+            svg.appendChild(l);
+          });
+
+          // "Jan 2025" label under each month bracket
+          const mLbl = document.createElementNS(svgNS, "text");
+          mLbl.setAttribute("x", midX); mLbl.setAttribute("y", yearLabelY);
+          mLbl.setAttribute("text-anchor", "middle"); mLbl.setAttribute("font-size", "10");
+          mLbl.setAttribute("font-weight", "600"); mLbl.setAttribute("fill", COLOR_TEXT);
+          mLbl.textContent = `${MONTH_ABBR[mIdx]} ${year}`;
+          svg.appendChild(mLbl);
+        });
+
+      } else {
+        // Month-mode: same label density logic as before
+        const numYears = Object.keys(
+          ticks.reduce((acc, m) => { acc[m.split("-")[0]] = 1; return acc; }, {})
+        ).length;
+
+        const yearGroups = {};
+        ticks.forEach((tick, i) => {
+          const [year] = tick.split("-");
+          if (!yearGroups[year]) yearGroups[year] = { start: i, end: i };
+          yearGroups[year].end = i;
+        });
+
+        ticks.forEach((tick, i) => {
+          const x = getX(i);
+          const [, monthNum] = tick.split("-");
+          const mIdx = parseInt(monthNum, 10) - 1;
+          const isLastTick = i === ticks.length - 1;
+
+          const tickEl = document.createElementNS(svgNS, "line");
+          tickEl.setAttribute("x1", x); tickEl.setAttribute("y1", margin.top + innerHeight);
+          tickEl.setAttribute("x2", x); tickEl.setAttribute("y2", margin.top + innerHeight + (isLastTick ? 6 : 4));
+          tickEl.setAttribute("stroke", isLastTick ? COLOR_AXIS : COLOR_AXIS);
+          tickEl.setAttribute("stroke-width", isLastTick ? "1.8" : "1");
+          svg.appendChild(tickEl);
+
+          let labelText = null;
+          if (isLastTick)             labelText = MONTH_ABBR[mIdx];
+          else if (isScrollable)      labelText = MONTH_ABBR[mIdx];
+          else if (numYears <= 3)     labelText = MONTH_ABBR[mIdx];
+          else if (numYears <= 6)     labelText = MONTH_ABBR[mIdx][0];
+
+          if (labelText) {
+            const lbl = document.createElementNS(svgNS, "text");
+            lbl.setAttribute("x", x); lbl.setAttribute("y", margin.top + innerHeight + 15);
+            lbl.setAttribute("text-anchor", isLastTick ? "end" : "middle");
+            lbl.setAttribute("font-size", "10");
+            lbl.setAttribute("fill", COLOR_TEXT);
+            lbl.setAttribute("font-weight", isLastTick ? "700" : "400");
+            lbl.textContent = labelText;
+            svg.appendChild(lbl);
+          }
+        });
+
+        // Year brackets
+        Object.entries(yearGroups).forEach(([year, { start, end }]) => {
+          const xStart = getX(start);
+          const xEnd   = getX(end);
+          const midX   = (xStart + xEnd) / 2;
+          const bBot   = bracketY + 10;
+
+          [[xStart, bracketY, xStart, bBot],
+           [xStart, bBot,     xEnd,   bBot],
+           [xEnd,   bracketY, xEnd,   bBot]].forEach(([x1, y1, x2, y2]) => {
+            const l = document.createElementNS(svgNS, "line");
+            l.setAttribute("x1", x1); l.setAttribute("y1", y1);
+            l.setAttribute("x2", x2); l.setAttribute("y2", y2);
+            l.setAttribute("stroke", COLOR_MUTED); l.setAttribute("stroke-width", "1");
+            svg.appendChild(l);
+          });
+
+          const yearText = document.createElementNS(svgNS, "text");
+          yearText.setAttribute("x", midX); yearText.setAttribute("y", yearLabelY);
+          yearText.setAttribute("text-anchor", "middle"); yearText.setAttribute("font-size", "11");
+          yearText.setAttribute("font-weight", "600"); yearText.setAttribute("fill", COLOR_TEXT);
+          yearText.textContent = year;
+          svg.appendChild(yearText);
+        });
+      }
 
       // ── Draw series lines ──
       function drawSeries(s, color, dashArray) {
         const points = s.values.map((v, i) => `${getX(i)},${getY(v.count)}`).join(" ");
         const polyline = document.createElementNS(svgNS, "polyline");
-        polyline.setAttribute("fill", "none");
-        polyline.setAttribute("stroke", color);
+        polyline.setAttribute("fill", "none"); polyline.setAttribute("stroke", color);
         polyline.setAttribute("stroke-width", "2.5");
         if (dashArray) polyline.setAttribute("stroke-dasharray", dashArray);
         polyline.setAttribute("points", points);
@@ -1430,18 +2805,15 @@ function init() {
           circle.setAttribute("cx", cx); circle.setAttribute("cy", cy);
           circle.setAttribute("r", "3"); circle.setAttribute("fill", color);
           const titleNode = document.createElementNS(svgNS, "title");
-          titleNode.textContent = `${s.label} | ${v.month}: ${v.count}`;
+          titleNode.textContent = `${s.label} | ${v.tick || v.month}: ${v.count}`;
           circle.appendChild(titleNode);
           svg.appendChild(circle);
 
           if (plotState.showDataLabels && v.count > 0) {
             const lbl = document.createElementNS(svgNS, "text");
-            lbl.setAttribute("x", cx);
-            lbl.setAttribute("y", cy - 20);
-            lbl.setAttribute("text-anchor", "middle");
-            lbl.setAttribute("font-size", "9");
-            lbl.setAttribute("fill", color);
-            lbl.setAttribute("font-weight", "700");
+            lbl.setAttribute("x", cx); lbl.setAttribute("y", cy - 20);
+            lbl.setAttribute("text-anchor", "middle"); lbl.setAttribute("font-size", "9");
+            lbl.setAttribute("fill", color); lbl.setAttribute("font-weight", "700");
             lbl.setAttribute("class", "wfns-data-label");
             lbl.textContent = v.count;
             svg.appendChild(lbl);
@@ -1449,47 +2821,39 @@ function init() {
         });
       }
 
-      // Draw status series first, then All on top
-      series.forEach(s => {
-        drawSeries(s, STATUS_COLORS[s.key] || "#888", null);
-      });
+      series.forEach(s => drawSeries(s, STATUS_COLORS[s.key] || "#888", null));
+      if (allSeries) drawSeries(allSeries, ALL_COLOR, "6,3");
 
-      if (allSeries) {
-        drawSeries(allSeries, ALL_COLOR, "6,3");
-      }
-
+      // ── Wrap ──
       const svgWrap = document.createElement("div");
-      svgWrap.id = "wfns-timeline-wrap";
-      svgWrap.style.cssText = "overflow-x: auto; padding-bottom: 6px;";
+      svgWrap.className = "wfns-timeline-wrap";
+      svgWrap.style.cssText = isScrollable
+        ? "overflow-x: auto; padding-bottom: 6px;"
+        : "overflow-x: hidden; padding-bottom: 6px;";
       svgWrap.appendChild(svg);
       outer.appendChild(svgWrap);
 
       // ── Legend ──
       const legend = document.createElement("div");
       legend.style.cssText = "display:flex; flex-wrap:wrap; gap:12px; margin-top:12px;";
-
       series.forEach(s => {
         const color = STATUS_COLORS[s.key] || "#888";
         const item = document.createElement("div");
         item.className = "wfns-legend-item";
         item.innerHTML = `
           <span style="display:inline-block;width:12px;height:12px;background:${color};border-radius:2px;"></span>
-          <span>${s.label}</span>
-        `;
+          <span>${s.label}</span>`;
         legend.appendChild(item);
       });
-
       if (allSeries) {
         const item = document.createElement("div");
         item.className = "wfns-legend-item";
         item.innerHTML = `
           <span style="display:inline-block;width:20px;height:3px;background:${ALL_COLOR};border-radius:2px;
-            border-top: 2px dashed ${ALL_COLOR}; margin-top:4px;"></span>
-          <span>All Submissions</span>
-        `;
+            border-top:2px dashed ${ALL_COLOR};margin-top:4px;"></span>
+          <span>All Submissions</span>`;
         legend.appendChild(item);
       }
-
       outer.appendChild(legend);
       chart.appendChild(outer);
     }
@@ -1513,24 +2877,52 @@ function init() {
     }
 
     function renderPlots() {
-    //location plot
-      const stackedData = buildStackedAreaData(nominations);
-      const topAreas = getTopAreas(stackedData, plotState.maxBars);
-      renderVerticalStackedBarChart(topAreas);
+      const chartScopes = getVisibleChartScopes();
+      const areaChart = document.getElementById("wfns-plot-chart");
+      const timelineChart = document.getElementById("wfns-timeline-chart");
 
-      //timeline plot
-      const timelineData = buildTimelineLineData(nominations);
-      renderTimelineChart(timelineData);
+      if (!chartScopes.length) {
+        if (areaChart) areaChart.textContent = "Select at least one type to show Area plots.";
+        if (timelineChart) timelineChart.textContent = "Select at least one type to show Timeline plots.";
+        return;
+      }
+
+      if (areaChart) areaChart.innerHTML = "";
+      chartScopes.forEach(scope => {
+        const stackedData = buildStackedAreaData(nominations, scope);
+        const topAreas = getTopAreas(stackedData, plotState.maxBars);
+        renderVerticalStackedBarChart(topAreas, scope, true);
+      });
+
+      if (timelineChart) timelineChart.innerHTML = "";
+      chartScopes.forEach(scope => {
+        const timelineData = buildTimelineLineData(nominations, scope);
+        renderTimelineChart(timelineData, scope, true);
+      });
     }
 
     function getAvailableAreas(nominations) {
-      const areas = Array.from(
-        new Set(
-          nominations
-            .filter(n => n)
-            .map(n => getAreaLabel(n, plotState.aggregationMode))
-        )
-      ).sort();
+      const allLabels = nominations
+        .filter(n => n)
+        .map(n => getAreaLabel(n, plotState.aggregationMode))
+        .filter(a => a !== "__OSM_PENDING__");
+
+      let areas;
+      if (plotState.timelineAreaProvinceOnly) {
+        // Extract the province/state level from each label and deduplicate
+        areas = Array.from(new Set(allLabels.map(label => {
+          const parts = label.split(",").map(s => s.trim()).filter(Boolean);
+          if (parts.length >= 2) {
+            // e.g. "Linh Trung, Thu Duc, Vietnam" → "Thu Duc, Vietnam"
+            // e.g. "Ho Chi Minh, Vietnam" → "Ho Chi Minh, Vietnam"
+            // Take everything from the second-to-last part onward
+            return parts.slice(parts.length >= 3 ? 1 : 0).join(", ");
+          }
+          return label;
+        }))).sort();
+      } else {
+        areas = Array.from(new Set(allLabels)).sort();
+      }
 
       return areas;
     }
@@ -1554,16 +2946,28 @@ function init() {
           ...s,
           values: s.values.map(v => {
             runningTotal += v.count;
-            return {
-              ...v,
-              count: runningTotal
-            };
+            return { ...v, count: runningTotal };
           })
         };
       });
     }
 
+    // Same as makeSeriesCumulative but values use { tick, count } keys
+    function makeSeriesCumulativeTicks(series) {
+      return series.map(s => {
+        let runningTotal = 0;
+        return {
+          ...s,
+          values: s.values.map(v => {
+            runningTotal += v.count;
+            return { ...v, count: runningTotal };
+          })
+        };
+      });
+    }
+
+    watchForNominationsRoute();
+    scheduleRenderPlotsApp(400);
 }
 
 init();
-
