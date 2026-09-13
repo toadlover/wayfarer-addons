@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.0.29
+// @version     0.3
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
 // @homepageURL https://github.com/toadlover/wayfarer-addons/
+// @match       https://wayfarer.scopely.com/*
 // @match       https://wayfarer.nianticlabs.com/*
 // ==/UserScript==
 
@@ -76,9 +77,21 @@ function init() {
       EDIT_LOCATION: "Edit Location"
     };
 
+    const TYPE_TITLE_DISPLAY = {
+      NOMINATION: "Nominations",
+      PHOTO: "Photos",
+      EDIT_TITLE: "Title",
+      EDIT_DESCRIPTION: "Description",
+      EDIT_LOCATION: "Location"
+    };
+
+    const CHART_SCOPE_ALL_SELECTED = "__ALL_SELECTED_TYPES__";
+
     const plotState = {
       selectedStatuses: new Set(["ACCEPTED"]),
       selectedTypes: new Set(["NOMINATION"]),
+      visibleChartScopes: null,
+      _chartScopeOptionKeys: null,
       aggregationMode: "cityState", // or "state"
       maxBars: 20, // default number of bars to display in plot
       timelineAreaFilter: "__ALL__",
@@ -300,24 +313,38 @@ function init() {
       });
     }
 
-    async function exportAreaPlotAsPng() {
+    function getExportCard(target, rootId, wrapSelector) {
+      let card = target && target.closest ? target.closest(".wfns-chart-card") : null;
+      if (!card && target && target.querySelector) card = target;
+
+      const root = document.getElementById(rootId);
+      if ((!card || !card.querySelector(wrapSelector)) && root) {
+        card = root.querySelector(".wfns-chart-card");
+      }
+
+      const wrap = card && card.querySelector ? card.querySelector(wrapSelector) : null;
+      return { card, wrap };
+    }
+
+    async function exportAreaPlotAsPng(target, chartScope) {
       await loadHtml2Canvas();
 
-      const chart = document.getElementById("wfns-plot-chart");
-      const barsWrap = document.getElementById("wfns-bars-wrap");
+      const { card, wrap: barsWrap } = getExportCard(target, "wfns-plot-chart", ".wfns-bars-wrap");
 
-      if (!chart || !barsWrap) {
+      if (!card || !barsWrap) {
         console.log("Plot export failed: chart or barsWrap not found.");
         return;
       }
 
       const original = {
-        chartWidth: chart.style.width,
-        chartOverflow: chart.style.overflow,
+        chartWidth: card.style.width,
+        chartOverflow: card.style.overflow,
         barsWrapWidth: barsWrap.style.width,
         barsWrapOverflow: barsWrap.style.overflow,
         barsWrapOverflowX: barsWrap.style.overflowX,
       };
+      const exportButtons = Array.from(card.querySelectorAll(".wfns-chart-export-button"));
+      const buttonVisibility = exportButtons.map(button => button.style.visibility);
 
       try {
         const fullWidth = Math.max(barsWrap.scrollWidth, barsWrap.clientWidth);
@@ -326,10 +353,11 @@ function init() {
         barsWrap.style.overflow = "visible";
         barsWrap.style.overflowX = "visible";
 
-        chart.style.width = `${fullWidth + 40}px`;
-        chart.style.overflow = "visible";
+        card.style.width = `${fullWidth + 40}px`;
+        card.style.overflow = "visible";
+        exportButtons.forEach(button => { button.style.visibility = "hidden"; });
 
-        const canvas = await html2canvas(chart, {
+        const canvas = await html2canvas(card, {
           backgroundColor: "#ffffff",
           scale: 2,
           useCORS: true
@@ -339,42 +367,43 @@ function init() {
         const mode = plotState.aggregationMode === "state" ? "state" : "citystate";
         const date = new Date().toISOString().slice(0, 10);
 
-        const types = Array.from(plotState.selectedTypes).join("-");
+        const scopePart = getChartScopeFilenamePart(chartScope);
         const statuses = Array.from(plotState.selectedStatuses).join("-");
 
-        //link.download = `wayfarer_plot_${mode}_${date}.png`;
-        link.download = `wayfarer_${mode}_${types}_${statuses}_${date}.png`;
+        link.download = `wayfarer_area_${mode}_${scopePart}_${statuses}_${date}.png`;
         link.href = canvas.toDataURL("image/png");
         link.click();
       } catch (err) {
         console.log("Plot export failed:", err);
       } finally {
-        chart.style.width = original.chartWidth;
-        chart.style.overflow = original.chartOverflow;
+        card.style.width = original.chartWidth;
+        card.style.overflow = original.chartOverflow;
         barsWrap.style.width = original.barsWrapWidth;
         barsWrap.style.overflow = original.barsWrapOverflow;
         barsWrap.style.overflowX = original.barsWrapOverflowX;
+        exportButtons.forEach((button, idx) => { button.style.visibility = buttonVisibility[idx]; });
       }
     }
 
-    async function exportTimelinePlotAsPng() {
+    async function exportTimelinePlotAsPng(target, chartScope) {
       await loadHtml2Canvas();
 
-      const chart = document.getElementById("wfns-timeline-chart");
-      const timelineWrap = document.getElementById("wfns-timeline-wrap");
+      const { card, wrap: timelineWrap } = getExportCard(target, "wfns-timeline-chart", ".wfns-timeline-wrap");
 
-      if (!chart || !timelineWrap) {
+      if (!card || !timelineWrap) {
         console.log("Timeline export failed: chart or timelineWrap not found.");
         return;
       }
 
       const original = {
-        chartWidth: chart.style.width,
-        chartOverflow: chart.style.overflow,
+        chartWidth: card.style.width,
+        chartOverflow: card.style.overflow,
         wrapWidth: timelineWrap.style.width,
         wrapOverflow: timelineWrap.style.overflow,
         wrapOverflowX: timelineWrap.style.overflowX,
       };
+      const exportButtons = Array.from(card.querySelectorAll(".wfns-chart-export-button"));
+      const buttonVisibility = exportButtons.map(button => button.style.visibility);
 
       try {
         const fullWidth = Math.max(timelineWrap.scrollWidth, timelineWrap.clientWidth);
@@ -383,10 +412,11 @@ function init() {
         timelineWrap.style.overflow = "visible";
         timelineWrap.style.overflowX = "visible";
 
-        chart.style.width = `${fullWidth + 40}px`;
-        chart.style.overflow = "visible";
+        card.style.width = `${fullWidth + 40}px`;
+        card.style.overflow = "visible";
+        exportButtons.forEach(button => { button.style.visibility = "hidden"; });
 
-        const canvas = await html2canvas(chart, {
+        const canvas = await html2canvas(card, {
           backgroundColor: "#ffffff",
           scale: 2,
           useCORS: true
@@ -398,71 +428,171 @@ function init() {
           plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
             ? plotState.timelineAreaFilter.replace(/[^a-zA-Z0-9_-]+/g, "_")
             : "allareas";
+        const scopePart = getChartScopeFilenamePart(chartScope);
         const date = new Date().toISOString().slice(0, 10);
 
-        link.download = `wayfarer_timeline_${mode}_${areaPart}_${date}.png`;
+        link.download = `wayfarer_timeline_${mode}_${areaPart}_${scopePart}_${date}.png`;
         link.href = canvas.toDataURL("image/png");
         link.click();
       } catch (err) {
         console.log("Timeline export failed:", err);
       } finally {
-        chart.style.width = original.chartWidth;
-        chart.style.overflow = original.chartOverflow;
+        card.style.width = original.chartWidth;
+        card.style.overflow = original.chartOverflow;
         timelineWrap.style.width = original.wrapWidth;
         timelineWrap.style.overflow = original.wrapOverflow;
         timelineWrap.style.overflowX = original.wrapOverflowX;
+        exportButtons.forEach((button, idx) => { button.style.visibility = buttonVisibility[idx]; });
       }
     }
 
     /**
-     * Overwrite the open method of the XMLHttpRequest.prototype to intercept the server calls
+     * Wayfarer moved from wayfarer.nianticlabs.com to wayfarer.scopely.com and the
+     * Angular app now issues the manage call through both XHR and fetch, sometimes
+     * with an absolute URL and/or a query string. Normalise before matching so the
+     * plots keep working on the new site.
      */
+    const MANAGE_PATH = '/api/v1/vault/manage';
+
+    function isManageListUrl(url) {
+        try {
+            const path = new URL(String(url), window.location.origin).pathname.replace(/\/+$/, '');
+            return path === MANAGE_PATH;
+        } catch (e) {
+            return String(url).split('?')[0].replace(/\/+$/, '') === MANAGE_PATH;
+        }
+    }
+
     (function (open) {
         XMLHttpRequest.prototype.open = function (method, url) {
-            if (url == '/api/v1/vault/manage') {
-                if (method == 'GET') {
-                    this.addEventListener('load', parseNominations, false);
-                }
+            if (String(method).toUpperCase() === 'GET' && isManageListUrl(url)) {
+                this.addEventListener('load', parseNominations, false);
             }
-            open.apply(this, arguments);
+            return open.apply(this, arguments);
         };
     })(XMLHttpRequest.prototype.open);
 
-    function parseNominations(e) {
+    (function (nativeFetch) {
+        if (typeof nativeFetch !== 'function') return;
+        window.fetch = function (input, options) {
+            const url = typeof input === 'string' ? input : (input && input.url) || '';
+            const method = String((options && options.method) || (input && input.method) || 'GET').toUpperCase();
+            const result = nativeFetch.apply(this, arguments);
+            if (method !== 'GET' || !isManageListUrl(url)) return result;
+            return result.then(response => {
+                response.clone().json()
+                    .then(json => ingestManageJson(json))
+                    .catch(() => {});
+                return response;
+            });
+        };
+    })(window.fetch);
+
+    function ingestManageJson(json) {
+        if (!json || json.captcha) return false;
+        const submissions = json.result && json.result.submissions;
+        if (!Array.isArray(submissions)) return false;
+        nominations = submissions;
+        scheduleRenderPlotsApp();
+        return true;
+    }
+
+    function parseNominations() {
         try {
-            const response = this.response;
-            const json = JSON.parse(response);
-            if (!json) {
-                console.log('Failed to parse response from Wayfarer');
-                return;
+            const raw = this.response || this.responseText;
+            const json = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            if (!ingestManageJson(json)) {
+                console.log('[WFNS Plots] Manage response did not include nominations.');
             }
-            // ignore if it's related to captchas
-            if (json.captcha)
-                return;
-
-            nominations = json.result.submissions;
-            if (!nominations) {
-                console.log('Wayfarer\'s response didn\'t include nominations.');
-                return;
-            }
-            setTimeout(() => {
-                renderPlotsApp();
-            }, 300);
-
-        } catch (e)    {
+        } catch (e) {
             console.log(e); // eslint-disable-line no-console
         }
     }
 
+    /**
+     * Wayfarer Map Mods 4.0 already caches every contribution from the same endpoint.
+     * If it is present we can render immediately instead of waiting for a network call
+     * that may have happened before this script ran.
+     */
+    function nominationsFromMapMods() {
+        try {
+            const list = window.WFMM && window.WFMM.contributions && window.WFMM.contributions.list();
+            if (!Array.isArray(list) || !list.length) return null;
+            return list.map(entry => (entry && entry.raw) || entry).filter(Boolean);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    let renderTimer = 0;
+    function scheduleRenderPlotsApp(delay) {
+        clearTimeout(renderTimer);
+        renderTimer = setTimeout(renderPlotsApp, typeof delay === 'number' ? delay : 300);
+    }
+
+    function isNominationsRoute() {
+        return /\/nominations(\/|$)/.test(window.location.pathname);
+    }
+
     async function renderPlotsApp() {
-        awaitElement(() => document.querySelector('app-submissions-list'))
+        if (!isNominationsRoute()) return;
+        if (!Array.isArray(nominations) || !nominations.length) {
+            const cached = nominationsFromMapMods();
+            if (!cached) return;
+            nominations = cached;
+        }
+        awaitElement(() => findPlotsAnchor())
             .then(() => {
                 addCss();
                 addPlotsSection();
             })
             .catch(() => {
-                console.log("Could not find app-submissions-list.");
+                console.log('[WFNS Plots] Could not find the nominations list container.');
             });
+    }
+
+    /**
+     * The new nominations page wraps the list in <app-submissions>; older builds used
+     * a plain .submissions block. Accept either, and fall back to the list host itself.
+     */
+    function findPlotsAnchor() {
+        const list = document.querySelector('app-submissions-list');
+        if (!list) return null;
+        return document.querySelector('.submissions')
+            || document.querySelector('app-submissions')
+            || list.parentElement
+            || list;
+    }
+
+    /**
+     * The page is a SPA: re-attach when the user navigates back to the nominations
+     * route, and when Angular tears the list down and rebuilds it.
+     */
+    function watchForNominationsRoute() {
+        let lastPath = window.location.pathname;
+        const check = () => {
+            if (window.location.pathname === lastPath) return;
+            lastPath = window.location.pathname;
+            scheduleRenderPlotsApp(200);
+        };
+        ['pushState', 'replaceState'].forEach(name => {
+            const original = history[name];
+            history[name] = function () {
+                const result = original.apply(this, arguments);
+                queueMicrotask(check);
+                return result;
+            };
+        });
+        window.addEventListener('popstate', check);
+
+        let observerTimer = 0;
+        new MutationObserver(() => {
+            if (!isNominationsRoute()) return;
+            if (document.getElementById('wfns-plots-root')) return;
+            if (!document.querySelector('app-submissions-list')) return;
+            clearTimeout(observerTimer);
+            observerTimer = setTimeout(renderPlotsApp, 120);
+        }).observe(document.documentElement, { childList: true, subtree: true });
     }
 
     function addCss() {
@@ -581,7 +711,7 @@ function init() {
                 max-width: none;
             }
 
-            #wfns-bars-wrap { justify-content: flex-start; }
+            .wfns-bars-wrap { justify-content: flex-start; }
 
             /* Control blocks */
             .wfns-control-block {
@@ -685,10 +815,42 @@ function init() {
                 padding: 16px;
             }
 
-            .wfns-chart-title {
-                font-weight: 700;
+            .wfns-chart-card + .wfns-chart-card {
+                margin-top: 16px;
+            }
+
+            .wfns-chart-header {
+                display: flex;
+                align-items: flex-start;
+                justify-content: space-between;
+                gap: 6px;
                 margin-bottom: 12px;
+            }
+
+            .wfns-chart-title {
+                flex: 1 1 auto;
+                min-width: 0;
+                font-weight: 700;
+                margin-bottom: 0;
                 color: var(--wfns-text);
+                line-height: 1.35;
+                overflow-wrap: anywhere;
+            }
+
+            .wfns-chart-export-button {
+                flex: 0 0 auto;
+                white-space: nowrap;
+            }
+
+            #wfns-plots-root .wfns-chart-export-button {
+                width: 28px;
+                min-width: 28px;
+                max-width: 28px;
+                height: 22px;
+                padding: 2px 0;
+                font-size: 9px;
+                line-height: 1;
+                text-align: center;
             }
 
             .wfns-legend-item {
@@ -762,10 +924,9 @@ function init() {
     function addPlotsSection() {
       if (document.getElementById("wfns-plots-root")) return;
 
-      const list = document.querySelector("app-submissions-list");
-      const submissionsLayout = document.querySelector(".submissions");
+      const submissionsLayout = findPlotsAnchor();
 
-      if (!list || !submissionsLayout) return;
+      if (!submissionsLayout) return;
 
       const root = document.createElement("div");
       root.id = "wfns-plots-root";
@@ -802,6 +963,7 @@ function init() {
       if (!controls) return;
 
       controls.innerHTML = "";
+      syncVisibleChartScopes();
 
       // ── Helpers ──────────────────────────────────────────────────────────────
       function makeControlBlock() {
@@ -856,25 +1018,33 @@ function init() {
         return section;
       }
 
-      // ── Section 1: Max Bar ────────────────────────────────────────────────────
-      controls.appendChild(makeSection("Max Bar", (row) => {
-        const maxBarsBlock = makeControlBlock();
-        maxBarsBlock.appendChild(makeControlLabel("Max Bars"));
-        const maxBarsSelect = document.createElement("select");
-        maxBarsSelect.id = "wfns-max-bars";
-        maxBarsSelect.style.cssText = "padding: 4px 6px; border-radius: 4px;";
-        [20, 50, 100, 200].forEach(v => {
-          const opt = document.createElement("option");
-          opt.value = v; opt.textContent = v;
-          if (plotState.maxBars === v) opt.selected = true;
-          maxBarsSelect.appendChild(opt);
+      // ── Section 1: Chart selection ────────────────────────────────────────────
+      controls.appendChild(makeSection("Chart selection", (row) => {
+        const chartScopes = getChartScopeOptions();
+        if (chartScopes.length < 2) {
+          row.style.display = "none";
+          row.style.padding = "0";
+          return;
+        }
+
+        const chartShownBlock = makeControlBlock();
+        chartShownBlock.appendChild(makeControlLabel("Chart Shown"));
+
+        chartScopes.forEach(scope => {
+          const label = document.createElement("label");
+          label.style.cssText = "display:block; margin-bottom:4px; cursor:pointer; white-space:nowrap;";
+          label.innerHTML = `<input type="checkbox" data-chart-scope="${scope.key}" ${plotState.visibleChartScopes.has(scope.key) ? "checked" : ""}> ${scope.label}`;
+          if (scope.key === CHART_SCOPE_ALL_SELECTED) {
+            label.title = "Includes every selected type.";
+          }
+          chartShownBlock.appendChild(label);
         });
-        const allOpt = document.createElement("option");
-        allOpt.value = "all"; allOpt.textContent = "All";
-        if (plotState.maxBars === "all") allOpt.selected = true;
-        maxBarsSelect.appendChild(allOpt);
-        maxBarsBlock.appendChild(maxBarsSelect);
-        row.appendChild(maxBarsBlock);
+
+        const chartShownNote = document.createElement("div");
+        chartShownNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
+        chartShownNote.textContent = "Applies to Area and Timeline plots";
+        chartShownBlock.appendChild(chartShownNote);
+        row.appendChild(chartShownBlock);
       }));
 
       // ── Section 2: Type / Status ──────────────────────────────────────────────
@@ -960,7 +1130,7 @@ function init() {
         `;
         const allSubAreaNote = document.createElement("div");
         allSubAreaNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
-        allSubAreaNote.textContent = "Show unselected as blank";
+        allSubAreaNote.textContent = "Show unselected statuses as blank";
         allSubAreaBlock.appendChild(allSubAreaWrap);
         allSubAreaBlock.appendChild(allSubAreaNote);
         row.appendChild(allSubAreaBlock);
@@ -979,7 +1149,7 @@ function init() {
         `;
         const allSubNote = document.createElement("div");
         allSubNote.style.cssText = "font-size:10px; margin-top:4px; color: var(--wfns-text-muted, #888);";
-        allSubNote.textContent = "Shows total regardless of status";
+        allSubNote.textContent = "Shows current chart types regardless of status";
         allSubBlock.appendChild(allSubWrap);
         allSubBlock.appendChild(allSubNote);
         row.appendChild(allSubBlock);
@@ -1001,6 +1171,24 @@ function init() {
           aggBlock.appendChild(lbl);
         });
         row.appendChild(aggBlock);
+
+        const maxBarsBlock = makeControlBlock();
+        maxBarsBlock.appendChild(makeControlLabel("Max Bars"));
+        const maxBarsSelect = document.createElement("select");
+        maxBarsSelect.id = "wfns-max-bars";
+        maxBarsSelect.style.cssText = "padding: 4px 6px; border-radius: 4px;";
+        [20, 50, 100, 200].forEach(v => {
+          const opt = document.createElement("option");
+          opt.value = v; opt.textContent = v;
+          if (plotState.maxBars === v) opt.selected = true;
+          maxBarsSelect.appendChild(opt);
+        });
+        const allOpt = document.createElement("option");
+        allOpt.value = "all"; allOpt.textContent = "All";
+        if (plotState.maxBars === "all") allOpt.selected = true;
+        maxBarsSelect.appendChild(allOpt);
+        maxBarsBlock.appendChild(maxBarsSelect);
+        row.appendChild(maxBarsBlock);
 
         // OSM cache block
         const osmBlock = makeControlBlock();
@@ -1238,31 +1426,6 @@ function init() {
         row.appendChild(chartViewBlock);
       }));
 
-      // ── Section 5: Download PNG ───────────────────────────────────────────────
-      controls.appendChild(makeSection("Download PNG", (row) => {
-        const exportBlock = makeControlBlock();
-        exportBlock.appendChild(makeControlLabel("Export Plots"));
-        exportBlock.style.minWidth = "180px";
-
-        const btnWrap = document.createElement("div");
-        btnWrap.style.cssText = "display:flex; flex-direction:column; gap:8px; margin-top:4px;";
-
-        const areaBtn = document.createElement("button");
-        areaBtn.id = "wfns-export-area-image";
-        areaBtn.textContent = "⬇ Export Area Plot";
-        areaBtn.addEventListener("click", () => exportAreaPlotAsPng());
-
-        const timelineBtn = document.createElement("button");
-        timelineBtn.id = "wfns-export-timeline-image";
-        timelineBtn.textContent = "⬇ Export Timeline Plot";
-        timelineBtn.addEventListener("click", () => exportTimelinePlotAsPng());
-
-        btnWrap.appendChild(areaBtn);
-        btnWrap.appendChild(timelineBtn);
-        exportBlock.appendChild(btnWrap);
-        row.appendChild(exportBlock);
-      }));
-
       // ── Populate timeline area dropdown ───────────────────────────────────────
       const timelineAreaSelect = controls.querySelector("#wfns-timeline-area");
       if (timelineAreaSelect) {
@@ -1330,6 +1493,24 @@ function init() {
         });
       });
 
+      controls.querySelectorAll("input[data-chart-scope]").forEach(input => {
+        input.addEventListener("change", (e) => {
+          const scopeKey = e.target.dataset.chartScope;
+          if (!(plotState.visibleChartScopes instanceof Set)) syncVisibleChartScopes();
+
+          if (e.target.checked) {
+            plotState.visibleChartScopes.add(scopeKey);
+          } else if (plotState.visibleChartScopes.size <= 1) {
+            e.target.checked = true;
+            return;
+          } else {
+            plotState.visibleChartScopes.delete(scopeKey);
+          }
+
+          renderPlots();
+        });
+      });
+
       controls.querySelectorAll("input[data-type]").forEach(input => {
         input.addEventListener("change", (e) => {
           const type = e.target.dataset.type;
@@ -1338,6 +1519,8 @@ function init() {
           } else {
             plotState.selectedTypes.delete(type);
           }
+          syncVisibleChartScopes();
+          renderPlotControls();
           renderPlots();
         });
       });
@@ -1516,6 +1699,95 @@ function init() {
       // Export buttons are wired directly inside the makeSection closure above.
     }
 
+    function getSelectedTypesInOrder() {
+      return PLOT_TYPE_OPTIONS.filter(type => plotState.selectedTypes.has(type));
+    }
+
+    function getTypeTitle(type) {
+      return TYPE_TITLE_DISPLAY[type] || TYPE_DISPLAY[type] || type;
+    }
+
+    function getTypesTitle(types) {
+      return types.map(getTypeTitle).join(", ");
+    }
+
+    function getChartScopeOptions() {
+      const selectedTypes = getSelectedTypesInOrder();
+      if (!selectedTypes.length) return [];
+
+      const typeScopes = selectedTypes.map(type => ({
+        key: type,
+        types: [type],
+        label: TYPE_DISPLAY[type] || type,
+        titleLabel: getTypeTitle(type),
+        filenamePart: type.toLowerCase().replace(/_/g, "-")
+      }));
+
+      if (selectedTypes.length < 2) return typeScopes;
+
+      return [{
+        key: CHART_SCOPE_ALL_SELECTED,
+        types: selectedTypes,
+        label: "All submissions",
+        titleLabel: getTypesTitle(selectedTypes),
+        filenamePart: "all-selected-types"
+      }, ...typeScopes];
+    }
+
+    function syncVisibleChartScopes() {
+      const options = getChartScopeOptions();
+      const optionKeys = new Set(options.map(option => option.key));
+
+      if (options.length <= 1) {
+        plotState.visibleChartScopes = new Set(options.map(option => option.key));
+        plotState._chartScopeOptionKeys = optionKeys;
+        return;
+      }
+
+      if (!(plotState.visibleChartScopes instanceof Set)) {
+        plotState.visibleChartScopes = new Set(optionKeys);
+        plotState._chartScopeOptionKeys = optionKeys;
+        return;
+      }
+
+      const previousOptionKeys = plotState._chartScopeOptionKeys instanceof Set
+        ? plotState._chartScopeOptionKeys
+        : new Set();
+      const visible = new Set(
+        Array.from(plotState.visibleChartScopes).filter(key => optionKeys.has(key))
+      );
+
+      optionKeys.forEach(key => {
+        if (!previousOptionKeys.has(key)) visible.add(key);
+      });
+
+      if (!visible.size && optionKeys.has(CHART_SCOPE_ALL_SELECTED)) {
+        visible.add(CHART_SCOPE_ALL_SELECTED);
+      } else if (!visible.size && options[0]) {
+        visible.add(options[0].key);
+      }
+
+      plotState.visibleChartScopes = visible;
+      plotState._chartScopeOptionKeys = optionKeys;
+    }
+
+    function getVisibleChartScopes() {
+      syncVisibleChartScopes();
+      const options = getChartScopeOptions();
+      if (options.length <= 1) return options;
+      return options.filter(option => plotState.visibleChartScopes.has(option.key));
+    }
+
+    function nominationMatchesChartScope(nomination, chartScope) {
+      if (!chartScope || !chartScope.types || !chartScope.types.length) return false;
+      return chartScope.types.some(type => nominationMatchesSelectedType(nomination, type));
+    }
+
+    function getChartScopeFilenamePart(chartScope) {
+      if (!chartScope) return "unknown";
+      return chartScope.filenamePart || String(chartScope.key).toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+    }
+
     function getAreaLabel(nomination, aggregationMode) {
       if (aggregationMode === "osm") {
         if (nomination.lat != null && nomination.lng != null) {
@@ -1537,9 +1809,9 @@ function init() {
       return nomination.type === selectedType;
     }
 
-    function buildStackedAreaData(nominations) {
+    function buildStackedAreaData(nominations, chartScope) {
       const result = {};
-      const totalByArea = {}; // total nominations per area regardless of status/type filter
+      const totalByArea = {}; // total submissions per area inside this chart's type scope
 
       // Area date-range gate
       let areaRangeStart = null, areaRangeEnd = null;
@@ -1564,9 +1836,7 @@ function init() {
       nominations.forEach(nomination => {
         if (!nomination) return;
 
-        const typeMatch = Array.from(plotState.selectedTypes).some(type =>
-          nominationMatchesSelectedType(nomination, type)
-        );
+        if (!nominationMatchesChartScope(nomination, chartScope)) return;
 
         // Apply type/status shared date range
         if (tsRangeStart && tsRangeEnd) {
@@ -1586,11 +1856,8 @@ function init() {
 
         const area = getAreaLabel(nomination, plotState.aggregationMode);
 
-        // Always track grand total per area (all types/statuses) for "All Submissions" overlay
+        // Track this chart's total per area across all statuses.
         totalByArea[area] = (totalByArea[area] || 0) + 1;
-
-        // Type filter gates the stacked bar counts
-        if (!typeMatch) return;
 
         // Only count selected statuses for the stacked bar
         if (!plotState.selectedStatuses.has(nomination.status)) return;
@@ -1641,14 +1908,58 @@ function init() {
       HELD: "#ffc107"
     };
 
-    function renderVerticalStackedBarChart(areaRows) {
+    function makeChartHeader(titleText, onExport) {
+      const header = document.createElement("div");
+      header.className = "wfns-chart-header";
+
+      const title = document.createElement("div");
+      title.textContent = titleText;
+      title.className = "wfns-chart-title";
+      header.appendChild(title);
+
+      if (onExport) {
+        const exportButton = document.createElement("button");
+        exportButton.type = "button";
+        exportButton.className = "wfns-chart-export-button";
+        exportButton.textContent = "PNG";
+        exportButton.title = "Download this chart as a PNG";
+        exportButton.addEventListener("click", onExport);
+        header.appendChild(exportButton);
+      }
+
+      return header;
+    }
+
+    function getAreaTitle(chartScope) {
+      return `All Areas, ${chartScope.titleLabel} by Area`;
+    }
+
+    function getTimelineTitlePrefix() {
+      return plotState.timelineMode === "cumulative"
+        ? "Cumulative Timeline"
+        : "Timeline";
+    }
+
+    function getTimelineAreaTitle() {
+      return plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
+        ? plotState.timelineAreaFilter
+        : "All Areas";
+    }
+
+    function renderVerticalStackedBarChart(areaRows, chartScope, append = false) {
       const chart = document.getElementById("wfns-plot-chart");
       if (!chart) return;
 
-      chart.innerHTML = "";
+      if (!append) chart.innerHTML = "";
 
       if (!areaRows.length) {
-        chart.textContent = "No nominations match the current filters.";
+        const empty = document.createElement("div");
+        empty.className = "wfns-chart-card";
+        empty.appendChild(makeChartHeader(`${getAreaTitle(chartScope)} - no data`, null));
+        const message = document.createElement("div");
+        message.textContent = "No submissions match the current filters.";
+        empty.appendChild(message);
+        chart.appendChild(empty);
         return;
       }
 
@@ -1671,7 +1982,6 @@ function init() {
       const outer = document.createElement("div");
       outer.className = "wfns-chart-card";
 
-      const title = document.createElement("div");
       // Update area range info hint
       const areaRangeInfoEl = document.getElementById("wfns-area-range-info");
       const tsRangeInfoEl   = document.getElementById("wfns-ts-range-info");
@@ -1694,12 +2004,13 @@ function init() {
         ? ` [${plotState.areaRangeStart} → ${plotState.areaRangeEnd}]` : "";
       const tsDateRangeText = (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd)
         ? ` [${plotState.typeStatusRangeStart} → ${plotState.typeStatusRangeEnd}]` : "";
-      title.textContent = `Nominations by Area${areaDateRangeText}${tsDateRangeText}`;
-      title.className = "wfns-chart-title";
-      outer.appendChild(title);
+      outer.appendChild(makeChartHeader(
+        `${getAreaTitle(chartScope)}${areaDateRangeText}${tsDateRangeText}`,
+        () => exportAreaPlotAsPng(outer, chartScope)
+      ));
 
       const barsWrap = document.createElement("div");
-      barsWrap.id = "wfns-bars-wrap";
+      barsWrap.className = "wfns-bars-wrap";
       barsWrap.style.cssText = `
         display: flex;
         align-items: flex-end;
@@ -1969,7 +2280,7 @@ function init() {
       return months;
     }
 
-    function buildTimelineLineData(nominations) {
+    function buildTimelineLineData(nominations, chartScope) {
       const useRange = plotState.timelineRangeEnabled &&
                        plotState.timelineRangeStart &&
                        plotState.timelineRangeEnd;
@@ -2002,9 +2313,7 @@ function init() {
       nominations.forEach(nomination => {
         if (!nomination) return;
 
-        const typeMatch = Array.from(plotState.selectedTypes).some(type =>
-          nominationMatchesSelectedType(nomination, type)
-        );
+        if (!nominationMatchesChartScope(nomination, chartScope)) return;
 
         const area = getAreaLabel(nomination, plotState.aggregationMode);
         if (
@@ -2044,12 +2353,9 @@ function init() {
         const bucketKey = isDayMode ? getDayKey(nomination) : getMonthKey(nomination);
         if (!bucketKey || bucketKey === "Unknown") return;
 
-        // Always track "all submissions" regardless of type/status filter
+        // Track all statuses inside this chart's type scope.
         observedKeys.push(bucketKey);
         countsByKeyAll[bucketKey] = (countsByKeyAll[bucketKey] || 0) + 1;
-
-        // Type filter gates the per-status series only
-        if (!typeMatch) return;
 
         if (!plotState.selectedStatuses.has(nomination.status)) return;
         if (!countsByStatus[nomination.status]) countsByStatus[nomination.status] = {};
@@ -2118,15 +2424,21 @@ function init() {
       return { ticks, series, allSeries, rangeInfo, isDayMode };
     }
 
-    function renderTimelineChart(timelineData) {
+    function renderTimelineChart(timelineData, chartScope, append = false) {
       const chart = document.getElementById("wfns-timeline-chart");
       if (!chart) return;
-      chart.innerHTML = "";
+      if (!append) chart.innerHTML = "";
 
       const { ticks, series, allSeries, rangeInfo, isDayMode } = timelineData;
 
       if (!ticks || !ticks.length || (!series.length && !allSeries)) {
-        chart.textContent = "No timeline data for selected filters.";
+        const empty = document.createElement("div");
+        empty.className = "wfns-chart-card";
+        empty.appendChild(makeChartHeader(`${getTimelineTitlePrefix()} - ${getTimelineAreaTitle()}, ${chartScope.titleLabel} - no data`, null));
+        const message = document.createElement("div");
+        message.textContent = "No timeline data for selected filters.";
+        empty.appendChild(message);
+        chart.appendChild(empty);
         return;
       }
 
@@ -2168,18 +2480,15 @@ function init() {
       const outer = document.createElement("div");
       outer.className = "wfns-chart-card";
 
-      const titleEl = document.createElement("div");
-      titleEl.className = "wfns-chart-title";
-      const areaText = plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
-        ? ` (${plotState.timelineAreaFilter})` : " (All areas)";
-      const modeText = plotState.timelineMode === "cumulative"
-        ? "Cumulative Nominations Over Time" : "Nominations Over Time";
+      const timelineTitleBase = `${getTimelineTitlePrefix()} - ${getTimelineAreaTitle()}, ${chartScope.titleLabel}`;
       const rangeText = (plotState.timelineRangeEnabled && plotState.timelineRangeStart && plotState.timelineRangeEnd)
         ? ` [${plotState.timelineRangeStart} → ${plotState.timelineRangeEnd}]` : "";
       const tsRangeText = (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd)
         ? ` [${plotState.typeStatusRangeStart} → ${plotState.typeStatusRangeEnd}]` : "";
-      titleEl.textContent = `${modeText}${areaText}${rangeText}${tsRangeText}`;
-      outer.appendChild(titleEl);
+      outer.appendChild(makeChartHeader(
+        `${timelineTitleBase}${rangeText}${tsRangeText}`,
+        () => exportTimelinePlotAsPng(outer, chartScope)
+      ));
 
       // ── Y-scale ──
       const allSeriesValues = allSeries ? allSeries.values.map(v => v.count) : [];
@@ -2517,7 +2826,7 @@ function init() {
 
       // ── Wrap ──
       const svgWrap = document.createElement("div");
-      svgWrap.id = "wfns-timeline-wrap";
+      svgWrap.className = "wfns-timeline-wrap";
       svgWrap.style.cssText = isScrollable
         ? "overflow-x: auto; padding-bottom: 6px;"
         : "overflow-x: hidden; padding-bottom: 6px;";
@@ -2568,14 +2877,28 @@ function init() {
     }
 
     function renderPlots() {
-    //location plot
-      const stackedData = buildStackedAreaData(nominations);
-      const topAreas = getTopAreas(stackedData, plotState.maxBars);
-      renderVerticalStackedBarChart(topAreas);
+      const chartScopes = getVisibleChartScopes();
+      const areaChart = document.getElementById("wfns-plot-chart");
+      const timelineChart = document.getElementById("wfns-timeline-chart");
 
-      //timeline plot
-      const timelineData = buildTimelineLineData(nominations);
-      renderTimelineChart(timelineData);
+      if (!chartScopes.length) {
+        if (areaChart) areaChart.textContent = "Select at least one type to show Area plots.";
+        if (timelineChart) timelineChart.textContent = "Select at least one type to show Timeline plots.";
+        return;
+      }
+
+      if (areaChart) areaChart.innerHTML = "";
+      chartScopes.forEach(scope => {
+        const stackedData = buildStackedAreaData(nominations, scope);
+        const topAreas = getTopAreas(stackedData, plotState.maxBars);
+        renderVerticalStackedBarChart(topAreas, scope, true);
+      });
+
+      if (timelineChart) timelineChart.innerHTML = "";
+      chartScopes.forEach(scope => {
+        const timelineData = buildTimelineLineData(nominations, scope);
+        renderTimelineChart(timelineData, scope, true);
+      });
     }
 
     function getAvailableAreas(nominations) {
@@ -2643,6 +2966,8 @@ function init() {
       });
     }
 
+    watchForNominationsRoute();
+    scheduleRenderPlotsApp(400);
 }
 
 init();
