@@ -7,8 +7,8 @@
 // @homepageURL https://github.com/toadlover/wayfarer-addons/
 // @match       https://wayfarer.scopely.com/*
 // @match       https://wayfarer.nianticlabs.com/*
+// @run-at      document-start
 // ==/UserScript==
-
 // Copyright 2024 tehstone, Tntnnbltn
 // This file is part of the Wayfarer Addons collection.
 // This file is made as a modification of the wayfarer-nomination-stats.user.js script to display figure-like plots in the web page to summarize nomination stats over time or by submission area.
@@ -457,7 +457,7 @@ function init() {
     function isManageListUrl(url) {
         try {
             const path = new URL(String(url), window.location.origin).pathname.replace(/\/+$/, '');
-            return path === MANAGE_PATH;
+            return path === MANAGE_PATH || /^\/api\/v\d+\/vault\/(manage|submissions)$/.test(path);
         } catch (e) {
             return String(url).split('?')[0].replace(/\/+$/, '') === MANAGE_PATH;
         }
@@ -490,9 +490,10 @@ function init() {
 
     function ingestManageJson(json) {
         if (!json || json.captcha) return false;
-        const submissions = json.result && json.result.submissions;
+        const submissions = (json.result && json.result.submissions) || json.submissions;
         if (!Array.isArray(submissions)) return false;
         nominations = submissions;
+        console.log('[WFNS Plots] Loaded', submissions.length, 'submissions');
         scheduleRenderPlotsApp();
         return true;
     }
@@ -531,15 +532,19 @@ function init() {
     }
 
     function isNominationsRoute() {
-        return /\/nominations(\/|$)/.test(window.location.pathname);
+        return /\/(nominations|submit)(\/|$)/.test(window.location.pathname);
     }
 
     async function renderPlotsApp() {
         if (!isNominationsRoute()) return;
         if (!Array.isArray(nominations) || !nominations.length) {
             const cached = nominationsFromMapMods();
-            if (!cached) return;
-            nominations = cached;
+            if (cached) {
+                nominations = cached;
+            } else {
+                fetchNominationsDirectly();
+                return;
+            }
         }
         awaitElement(() => findPlotsAnchor())
             .then(() => {
@@ -551,17 +556,46 @@ function init() {
             });
     }
 
+    // Covers the case where the page's own request ran before this script hooked in.
+    let directFetchTried = false;
+    function fetchNominationsDirectly() {
+        if (directFetchTried) return;
+        directFetchTried = true;
+        console.log('[WFNS Plots] No intercepted data; requesting', MANAGE_PATH);
+        fetch(MANAGE_PATH, { credentials: 'include' })
+            .then(r => {
+                console.log('[WFNS Plots] Manage response status', r.status);
+                return r.json();
+            })
+            .then(json => {
+                if (!ingestManageJson(json)) {
+                    console.log('[WFNS Plots] Unexpected manage response shape:', json);
+                }
+            })
+            .catch(e => console.log('[WFNS Plots] Manage request failed:', e));
+    }
+
     /**
      * The new nominations page wraps the list in <app-submissions>; older builds used
      * a plain .submissions block. Accept either, and fall back to the list host itself.
      */
     function findPlotsAnchor() {
         const list = document.querySelector('app-submissions-list');
-        if (!list) return null;
-        return document.querySelector('.submissions')
-            || document.querySelector('app-submissions')
-            || list.parentElement
-            || list;
+        if (list) {
+            return document.querySelector('.submissions')
+                || document.querySelector('app-submissions')
+                || list.parentElement
+                || list;
+        }
+        // Overhauled /submit page: fall back to the first heading in the main content.
+        const main = document.querySelector('main') || document.querySelector('app-root');
+        const heading = main && main.querySelector('h1, h2');
+        if (heading) return heading.parentElement || heading;
+        // Unknown layout: prepend inside the main content container (never after hidden iframes).
+        const container = document.querySelector('main')
+            || document.querySelector('#root, #app, #__next, app-root')
+            || document.body;
+        return container ? { el: container, where: 'afterbegin' } : null;
     }
 
     /**
@@ -589,7 +623,7 @@ function init() {
         new MutationObserver(() => {
             if (!isNominationsRoute()) return;
             if (document.getElementById('wfns-plots-root')) return;
-            if (!document.querySelector('app-submissions-list')) return;
+            if (!findPlotsAnchor()) return;
             clearTimeout(observerTimer);
             observerTimer = setTimeout(renderPlotsApp, 120);
         }).observe(document.documentElement, { childList: true, subtree: true });
@@ -702,6 +736,10 @@ function init() {
                 max-width: none;
                 margin: 16px 0 0 0;
                 color: var(--wfns-text);
+                position: relative;
+                flex: 0 0 auto;
+                height: auto;
+                overflow: visible;
             }
 
             #wfns-plots-inner,
@@ -920,13 +958,32 @@ function init() {
         document.querySelector('head').appendChild(style);
     }
 
+    // The new page clips overflow on a fixed-height ancestor; let the first clipped one scroll.
+    function unclipPlotsAncestors() {
+      const root = document.getElementById("wfns-plots-root");
+      if (!root) return;
+      let el = root.parentElement;
+      while (el) {
+        const cs = getComputedStyle(el);
+        const clipped = cs.overflowY === "hidden" || cs.overflowY === "clip";
+        if (clipped && el.scrollHeight > el.clientHeight + 1) {
+          el.style.setProperty("overflow-y", "auto", "important");
+          return;
+        }
+        if (cs.overflowY === "auto" || cs.overflowY === "scroll") return;
+        el = el.parentElement;
+      }
+    }
+
     // Functionality to add plots section
     function addPlotsSection() {
       if (document.getElementById("wfns-plots-root")) return;
 
-      const submissionsLayout = findPlotsAnchor();
+      const anchor = findPlotsAnchor();
 
-      if (!submissionsLayout) return;
+      if (!anchor) return;
+      const submissionsLayout = anchor.el || anchor;
+      const insertWhere = anchor.where || "afterend";
 
       const root = document.createElement("div");
       root.id = "wfns-plots-root";
@@ -947,7 +1004,8 @@ function init() {
         </div>
       `;
 
-      submissionsLayout.insertAdjacentElement("afterend", root);
+      submissionsLayout.insertAdjacentElement(insertWhere, root);
+      console.log('[WFNS Plots] Inserted plots after', submissionsLayout.tagName, submissionsLayout.className);
 
       renderPlotControls();
       // Defer one frame so the browser has laid out the DOM before we read clientWidth
@@ -955,7 +1013,10 @@ function init() {
         renderPlots();
         // Start OSM geocoding AFTER DOM exists so progress bar can inject itself
         osmStartPrewarm(nominations);
+        [300, 1200, 3000].forEach(ms => setTimeout(unclipPlotsAncestors, ms));
       });
+      const plotsToggle = document.getElementById("collapsed-plots");
+      if (plotsToggle) plotsToggle.addEventListener("change", () => setTimeout(unclipPlotsAncestors, 400));
     }
 
     function renderPlotControls() {
