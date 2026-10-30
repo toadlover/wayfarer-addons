@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        Wayfarer Nomination Stats Plots (Dev)
-// @version     0.3
+// @version     0.4
 // @description Plot nomination trends and location summaries on the Wayfarer nominations page
 // @namespace   https://github.com/toadlover/wayfarer-addons/
 // @downloadURL https://raw.githubusercontent.com/toadlover/wayfarer-addons/main/wayfarer-nomination-stats-plots.user.js
@@ -119,29 +119,47 @@ function init() {
     let osmPendingCount = 0;
     let osmDoneCount    = 0;
 
+    // Round to 5 dp so tiny float drift doesn't create duplicate keys
+    function osmKey(lat, lng) {
+      return `${(+lat).toFixed(5)},${(+lng).toFixed(5)}`;
+    }
+
+    // The cache lives in memory; localStorage is only written (debounced) to persist it.
+    let osmStore = null;
+    let osmPersistTimer = 0;
+    const osmQueuedKeys = new Set();
+
+    function osmGetStore() {
+      if (!osmStore) {
+        try { osmStore = JSON.parse(localStorage.getItem(OSM_CACHE_KEY) || "{}") || {}; }
+        catch (_) { osmStore = {}; }
+      }
+      return osmStore;
+    }
+
+    function osmPersistStore() {
+      clearTimeout(osmPersistTimer);
+      osmPersistTimer = setTimeout(() => {
+        try { localStorage.setItem(OSM_CACHE_KEY, JSON.stringify(osmGetStore())); } catch (_) {}
+      }, 500);
+    }
+
     function osmCacheGet(lat, lng) {
-      try {
-        const raw   = localStorage.getItem(OSM_CACHE_KEY);
-        const store = raw ? JSON.parse(raw) : {};
-        // Round to 5 dp so tiny float drift doesn't create duplicate keys
-        return store[`${(+lat).toFixed(5)},${(+lng).toFixed(5)}`] || null;
-      } catch (_) { return null; }
+      return osmGetStore()[osmKey(lat, lng)] || null;
     }
 
     function osmCacheSet(lat, lng, value) {
-      try {
-        const raw   = localStorage.getItem(OSM_CACHE_KEY);
-        const store = raw ? JSON.parse(raw) : {};
-        store[`${(+lat).toFixed(5)},${(+lng).toFixed(5)}`] = value;
-        localStorage.setItem(OSM_CACHE_KEY, JSON.stringify(store));
-      } catch (_) {}
+      osmGetStore()[osmKey(lat, lng)] = value;
+      osmPersistStore();
     }
 
     function osmCacheSize() {
-      try {
-        const raw = localStorage.getItem(OSM_CACHE_KEY);
-        return raw ? Object.keys(JSON.parse(raw)).length : 0;
-      } catch (_) { return 0; }
+      return Object.keys(osmGetStore()).length;
+    }
+
+    function osmCacheReplace(store) {
+      osmStore = store;
+      osmPersistStore();
     }
 
     // Resolves to "State, CC" or falls back to "Unknown"
@@ -160,9 +178,11 @@ function init() {
       // zoom=14 → enough detail to return suburb/neighbourhood/town + city/county/state + country
       const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lng}&zoom=14&addressdetails=1`;
       fetch(url, { headers: { "Accept-Language": "en" } })
-        .then(r => r.json())
+        .then(r => (r.ok ? r.json() : null))
         .then(data => {
-          const addr = data.address || {};
+          // Rate-limit or error responses carry no address; don't cache them.
+          if (!data || !data.address) { resolve("Unknown"); return; }
+          const addr = data.address;
 
           // =========================
           // Town: smallest named locality
@@ -223,26 +243,27 @@ function init() {
     // Geocode every nomination that has coords and isn't already cached.
     // DOM progress bar is updated if present; re-renders when finished.
     function osmStartPrewarm(nominations) {
-      const uncached = nominations.filter(n =>
-        n && n.lat != null && n.lng != null && !osmCacheGet(n.lat, n.lng)
-      );
+      if (!Array.isArray(nominations)) return;
 
-      // Deduplicate by rounded key so we don't fire multiple requests for same spot
-      const seen   = new Set();
-      const unique = uncached.filter(n => {
-        const k = `${(+n.lat).toFixed(5)},${(+n.lng).toFixed(5)}`;
-        if (seen.has(k)) return false;
-        seen.add(k); return true;
+      // Skip cached coords and ones already queued so repeat calls never double-queue.
+      const unique = [];
+      nominations.forEach(n => {
+        if (!n || n.lat == null || n.lng == null) return;
+        const key = osmKey(n.lat, n.lng);
+        if (osmCacheGet(n.lat, n.lng) || osmQueuedKeys.has(key)) return;
+        osmQueuedKeys.add(key);
+        unique.push({ n, key });
       });
 
       if (!unique.length) return;
 
-      osmPendingCount = unique.length;
-      osmDoneCount    = 0;
+      if (osmDoneCount >= osmPendingCount) { osmPendingCount = 0; osmDoneCount = 0; }
+      osmPendingCount += unique.length;
       osmUpdateProgressBar();
 
-      unique.forEach(n => {
+      unique.forEach(({ n, key }) => {
         osmReverseGeocode(n.lat, n.lng).then(() => {
+          osmQueuedKeys.delete(key);
           osmDoneCount++;
           osmUpdateProgressBar();
           if (osmDoneCount >= osmPendingCount) {
@@ -313,6 +334,27 @@ function init() {
       });
     }
 
+    function getExportBackground() {
+      const isDark = document.body.classList.contains("dark") ||
+                     document.documentElement.classList.contains("dark");
+      return isDark ? "#242424" : "#ffffff";
+    }
+
+    function getAggregationFilenamePart() {
+      const mode = plotState.aggregationMode;
+      return mode === "state" ? "state" : mode === "osm" ? "osm" : "citystate";
+    }
+
+    async function ensureHtml2Canvas() {
+      try {
+        await loadHtml2Canvas();
+        return typeof window.html2canvas === "function";
+      } catch (err) {
+        console.log("[WFNS Plots] Could not load html2canvas (blocked or offline):", err);
+        return false;
+      }
+    }
+
     function getExportCard(target, rootId, wrapSelector) {
       let card = target && target.closest ? target.closest(".wfns-chart-card") : null;
       if (!card && target && target.querySelector) card = target;
@@ -327,7 +369,7 @@ function init() {
     }
 
     async function exportAreaPlotAsPng(target, chartScope) {
-      await loadHtml2Canvas();
+      if (!(await ensureHtml2Canvas())) return;
 
       const { card, wrap: barsWrap } = getExportCard(target, "wfns-plot-chart", ".wfns-bars-wrap");
 
@@ -358,13 +400,13 @@ function init() {
         exportButtons.forEach(button => { button.style.visibility = "hidden"; });
 
         const canvas = await html2canvas(card, {
-          backgroundColor: "#ffffff",
+          backgroundColor: getExportBackground(),
           scale: 2,
           useCORS: true
         });
 
         const link = document.createElement("a");
-        const mode = plotState.aggregationMode === "state" ? "state" : "citystate";
+        const mode = getAggregationFilenamePart();
         const date = new Date().toISOString().slice(0, 10);
 
         const scopePart = getChartScopeFilenamePart(chartScope);
@@ -386,7 +428,7 @@ function init() {
     }
 
     async function exportTimelinePlotAsPng(target, chartScope) {
-      await loadHtml2Canvas();
+      if (!(await ensureHtml2Canvas())) return;
 
       const { card, wrap: timelineWrap } = getExportCard(target, "wfns-timeline-chart", ".wfns-timeline-wrap");
 
@@ -417,13 +459,13 @@ function init() {
         exportButtons.forEach(button => { button.style.visibility = "hidden"; });
 
         const canvas = await html2canvas(card, {
-          backgroundColor: "#ffffff",
+          backgroundColor: getExportBackground(),
           scale: 2,
           useCORS: true
         });
 
         const link = document.createElement("a");
-        const mode = plotState.aggregationMode === "state" ? "state" : "citystate";
+        const mode = getAggregationFilenamePart();
         const areaPart =
           plotState.timelineAreaFilter && plotState.timelineAreaFilter !== "__ALL__"
             ? plotState.timelineAreaFilter.replace(/[^a-zA-Z0-9_-]+/g, "_")
@@ -493,7 +535,6 @@ function init() {
         const submissions = (json.result && json.result.submissions) || json.submissions;
         if (!Array.isArray(submissions)) return false;
         nominations = submissions;
-        console.log('[WFNS Plots] Loaded', submissions.length, 'submissions');
         scheduleRenderPlotsApp();
         return true;
     }
@@ -546,6 +587,10 @@ function init() {
                 return;
             }
         }
+        if (document.getElementById('wfns-plots-root')) {
+            refreshPlotsData();
+            return;
+        }
         awaitElement(() => findPlotsAnchor())
             .then(() => {
                 addCss();
@@ -561,12 +606,8 @@ function init() {
     function fetchNominationsDirectly() {
         if (directFetchTried) return;
         directFetchTried = true;
-        console.log('[WFNS Plots] No intercepted data; requesting', MANAGE_PATH);
         fetch(MANAGE_PATH, { credentials: 'include' })
-            .then(r => {
-                console.log('[WFNS Plots] Manage response status', r.status);
-                return r.json();
-            })
+            .then(r => r.json())
             .then(json => {
                 if (!ingestManageJson(json)) {
                     console.log('[WFNS Plots] Unexpected manage response shape:', json);
@@ -576,22 +617,14 @@ function init() {
     }
 
     /**
-     * The new nominations page wraps the list in <app-submissions>; older builds used
-     * a plain .submissions block. Accept either, and fall back to the list host itself.
+     * The overhauled page has no stable list element, so place the plots after the first
+     * heading's block in the main content, or at the top of the app container as a fallback.
      */
     function findPlotsAnchor() {
-        const list = document.querySelector('app-submissions-list');
-        if (list) {
-            return document.querySelector('.submissions')
-                || document.querySelector('app-submissions')
-                || list.parentElement
-                || list;
-        }
-        // Overhauled /submit page: fall back to the first heading in the main content.
         const main = document.querySelector('main') || document.querySelector('app-root');
         const heading = main && main.querySelector('h1, h2');
         if (heading) return heading.parentElement || heading;
-        // Unknown layout: prepend inside the main content container (never after hidden iframes).
+        // Prepend inside the container so the panel never lands after hidden iframes.
         const container = document.querySelector('main')
             || document.querySelector('#root, #app, #__next, app-root')
             || document.body;
@@ -607,6 +640,11 @@ function init() {
         const check = () => {
             if (window.location.pathname === lastPath) return;
             lastPath = window.location.pathname;
+            if (!isNominationsRoute()) {
+                const stale = document.getElementById('wfns-plots-root');
+                if (stale) stale.remove();
+                return;
+            }
             scheduleRenderPlotsApp(200);
         };
         ['pushState', 'replaceState'].forEach(name => {
@@ -618,6 +656,14 @@ function init() {
             };
         });
         window.addEventListener('popstate', check);
+
+        let resizeTimer = 0;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                if (document.getElementById('wfns-plots-root') && Array.isArray(nominations)) renderPlots();
+            }, 250);
+        });
 
         let observerTimer = 0;
         new MutationObserver(() => {
@@ -633,13 +679,10 @@ function init() {
         const css = `
             /* ── Theme tokens ── */
             #wfns-plots-root {
-                --wfns-bg:          #ffffff;
                 --wfns-bg-card:     #ffffff;
                 --wfns-border:      #dddddd;
                 --wfns-text:        #000000;
                 --wfns-text-muted:  #555555;
-                --wfns-axis:        #333333;
-                --wfns-grid:        #dddddd;
                 --wfns-ctrl-bg:     rgba(223,71,28,0.10);
                 --wfns-ctrl-bg2:    rgba(223,71,28,0.04);
                 --wfns-ctrl-border: #DF471C;
@@ -647,17 +690,13 @@ function init() {
                 --wfns-input-text:  #000000;
                 --wfns-btn-bg:      #e5e5e5;
                 --wfns-btn-text:    #000000;
-                --wfns-svg-bg:      #ffffff;
             }
 
             .dark #wfns-plots-root {
-                --wfns-bg:          #1a1a1a;
                 --wfns-bg-card:     #242424;
                 --wfns-border:      #3a3a3a;
                 --wfns-text:        #e8e8e8;
                 --wfns-text-muted:  #aaaaaa;
-                --wfns-axis:        #cccccc;
-                --wfns-grid:        #3a3a3a;
                 --wfns-ctrl-bg:     rgba(223,71,28,0.18);
                 --wfns-ctrl-bg2:    rgba(223,71,28,0.08);
                 --wfns-ctrl-border: #ff6b3d;
@@ -665,14 +704,13 @@ function init() {
                 --wfns-input-text:  #e8e8e8;
                 --wfns-btn-bg:      #3a3a3a;
                 --wfns-btn-text:    #e8e8e8;
-                --wfns-svg-bg:      #242424;
             }
 
-            .wrap-collabsible {
+            .wfns-collapsible {
                 margin-bottom: 1.2rem;
             }
 
-            .lbl-toggle-ns {
+            .wfns-lbl-toggle {
                 display: block;
                 font-weight: bold;
                 font-family: monospace;
@@ -687,9 +725,9 @@ function init() {
                 transition: all 0.25s ease-out;
             }
 
-            .lbl-toggle-ns:hover { color: lightgrey; }
+            .wfns-lbl-toggle:hover { color: lightgrey; }
 
-            .lbl-toggle-ns::before {
+            .wfns-lbl-toggle::before {
                 content: ' ';
                 display: inline-block;
                 border-top: 5px solid transparent;
@@ -701,28 +739,28 @@ function init() {
                 transition: transform .2s ease-out;
             }
 
-            .toggle { display: none; }
+            .wfns-toggle { display: none; }
 
-            .toggle:checked+.lbl-toggle-ns::before {
+            .wfns-toggle:checked+.wfns-lbl-toggle::before {
                 transform: rotate(90deg) translateX(-3px);
             }
 
-            .collapsible-content-ns {
+            .wfns-collapsible-content {
                 max-height: 0px;
                 overflow: hidden;
                 transition: max-height .25s ease-in-out;
             }
 
-            .toggle:checked+.lbl-toggle-ns+.collapsible-content-ns {
+            .wfns-toggle:checked+.wfns-lbl-toggle+.wfns-collapsible-content {
                 max-height: 9999999pt;
             }
 
-            .toggle:checked+.lbl-toggle-ns {
+            .wfns-toggle:checked+.wfns-lbl-toggle {
                 border-bottom-right-radius: 0;
                 border-bottom-left-radius: 0;
             }
 
-            .collapsible-content-ns .content-inner {
+            .wfns-collapsible-content .wfns-content-inner {
                 border-bottom: 1px solid var(--wfns-border, rgba(0,0,0,1));
                 border-left:   1px solid var(--wfns-border, rgba(0,0,0,1));
                 border-right:  1px solid var(--wfns-border, rgba(0,0,0,1));
@@ -952,10 +990,21 @@ function init() {
                 display: block;
             }
             `;
+        if (document.getElementById('wfns-plots-style')) return;
         const style = document.createElement('style');
+        style.id = 'wfns-plots-style';
         style.type = 'text/css';
         style.innerHTML = css;
         document.querySelector('head').appendChild(style);
+    }
+
+    // Re-render with fresh data when the plots are already on the page.
+    function refreshPlotsData() {
+      renderPlotControls();
+      requestAnimationFrame(() => {
+        renderPlots();
+        if (plotState.aggregationMode === "osm") osmStartPrewarm(nominations);
+      });
     }
 
     // The new page clips overflow on a fixed-height ancestor; let the first clipped one scroll.
@@ -991,11 +1040,11 @@ function init() {
       root.style.marginTop = "16px";
 
       root.innerHTML = `
-        <div class="wrap-collabsible">
-          <input id="collapsed-plots" class="toggle" type="checkbox" checked>
-          <label for="collapsed-plots" class="lbl-toggle-ns">View Nomination Plots</label>
-          <div class="collapsible-content-ns">
-            <div class="content-inner" id="wfns-plots-inner">
+        <div class="wfns-collapsible">
+          <input id="wfns-collapsed-plots" class="wfns-toggle" type="checkbox" checked>
+          <label for="wfns-collapsed-plots" class="wfns-lbl-toggle">View Nomination Plots</label>
+          <div class="wfns-collapsible-content">
+            <div class="wfns-content-inner" id="wfns-plots-inner">
               <div id="wfns-plot-controls"></div>
               <div id="wfns-plot-chart"></div>
               <div id="wfns-timeline-chart" style="margin-top: 20px;"></div>
@@ -1005,17 +1054,15 @@ function init() {
       `;
 
       submissionsLayout.insertAdjacentElement(insertWhere, root);
-      console.log('[WFNS Plots] Inserted plots after', submissionsLayout.tagName, submissionsLayout.className);
 
       renderPlotControls();
       // Defer one frame so the browser has laid out the DOM before we read clientWidth
       requestAnimationFrame(() => {
         renderPlots();
-        // Start OSM geocoding AFTER DOM exists so progress bar can inject itself
-        osmStartPrewarm(nominations);
+        if (plotState.aggregationMode === "osm") osmStartPrewarm(nominations);
         [300, 1200, 3000].forEach(ms => setTimeout(unclipPlotsAncestors, ms));
       });
-      const plotsToggle = document.getElementById("collapsed-plots");
+      const plotsToggle = document.getElementById("wfns-collapsed-plots");
       if (plotsToggle) plotsToggle.addEventListener("change", () => setTimeout(unclipPlotsAncestors, 400));
     }
 
@@ -1143,7 +1190,7 @@ function init() {
         // Date Range for both charts (by Type/Status)
         const tsDateRangeBlock = makeControlBlock();
         tsDateRangeBlock.appendChild(makeControlLabel("Date Range (Both)"));
-        const tsDateToggleWrap = document.createElement("label");
+        const tsDateToggleWrap = document.createElement("div");
         tsDateToggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px;";
         tsDateToggleWrap.innerHTML = `
           <label class="wfns-toggle-switch">
@@ -1180,7 +1227,7 @@ function init() {
         // All Submissions in area chart toggle
         const allSubAreaBlock = makeControlBlock();
         allSubAreaBlock.appendChild(makeControlLabel("Show All Submissions (Area Bar Plot)"));
-        const allSubAreaWrap = document.createElement("label");
+        const allSubAreaWrap = document.createElement("div");
         allSubAreaWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
         allSubAreaWrap.innerHTML = `
           <label class="wfns-toggle-switch">
@@ -1199,7 +1246,7 @@ function init() {
         // All submissions overlay toggle
         const allSubBlock = makeControlBlock();
         allSubBlock.appendChild(makeControlLabel("Show All Submissions (Timeline Plot)"));
-        const allSubWrap = document.createElement("label");
+        const allSubWrap = document.createElement("div");
         allSubWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
         allSubWrap.innerHTML = `
           <label class="wfns-toggle-switch">
@@ -1271,7 +1318,7 @@ function init() {
         osmExportBtn.style.cssText = "font-size:11px; padding:4px 8px; width:auto;";
         osmExportBtn.addEventListener("click", () => {
           try {
-            const raw = localStorage.getItem(OSM_CACHE_KEY) || "{}";
+            const raw = JSON.stringify(osmGetStore());
             const blob = new Blob([raw], { type: "application/json" });
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
@@ -1297,10 +1344,11 @@ function init() {
             reader.onload = (ev) => {
               try {
                 const imported = JSON.parse(ev.target.result);
-                const raw = localStorage.getItem(OSM_CACHE_KEY);
-                const existing = raw ? JSON.parse(raw) : {};
-                const merged = Object.assign({}, existing, imported);
-                localStorage.setItem(OSM_CACHE_KEY, JSON.stringify(merged));
+                const clean = {};
+                Object.entries(imported || {}).forEach(([k, v]) => {
+                  if (typeof v === "string") clean[k] = v;
+                });
+                osmCacheReplace(Object.assign({}, osmGetStore(), clean));
                 osmInfo.textContent = `${osmCacheSize()} coords cached`;
                 if (plotState.aggregationMode === "osm") renderPlots();
               } catch (err) { console.log("OSM cache import failed:", err); }
@@ -1314,9 +1362,9 @@ function init() {
         osmClearBtn.textContent = "Clear & Re-fetch";
         osmClearBtn.style.cssText = "font-size:11px; padding:4px 8px; width:auto;";
         osmClearBtn.addEventListener("click", () => {
-          localStorage.removeItem(OSM_CACHE_KEY);
+          osmCacheReplace({});
           osmInfo.textContent = "0 coords cached";
-          osmStartPrewarm(nominations);
+          if (plotState.aggregationMode === "osm") osmStartPrewarm(nominations);
         });
 
         osmBtnWrap.appendChild(osmExportBtn);
@@ -1337,7 +1385,7 @@ function init() {
           areaDateRangeBlock.title = blocked ? "Date Range (Both) is On — disable it first" : "";
         };
         _applyAreaRangeBlockedState();
-        const areaDateToggleWrap = document.createElement("label");
+        const areaDateToggleWrap = document.createElement("div");
         areaDateToggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px;";
         areaDateToggleWrap.innerHTML = `
           <label class="wfns-toggle-switch">
@@ -1409,7 +1457,7 @@ function init() {
           dateRangeBlock.title = blocked ? "Date Range (Both) is On — disable it first" : "";
         };
         _applyChartRangeBlockedState();
-        const dateRangeToggleWrap = document.createElement("label");
+        const dateRangeToggleWrap = document.createElement("div");
         dateRangeToggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-bottom:8px;";
         dateRangeToggleWrap.innerHTML = `
           <label class="wfns-toggle-switch">
@@ -1456,7 +1504,7 @@ function init() {
         // Show Numbers toggle
         const dataLabelsBlock = makeControlBlock();
         dataLabelsBlock.appendChild(makeControlLabel("Show Numbers"));
-        const toggleWrap = document.createElement("label");
+        const toggleWrap = document.createElement("div");
         toggleWrap.style.cssText = "display:flex; align-items:center; gap:8px; cursor:pointer; margin-top:4px;";
         toggleWrap.innerHTML = `
           <label class="wfns-toggle-switch">
@@ -1542,6 +1590,7 @@ function init() {
         input.addEventListener("change", (e) => {
           plotState.aggregationMode = e.target.value;
           plotState.timelineAreaFilter = "__ALL__";
+          if (plotState.aggregationMode === "osm") osmStartPrewarm(nominations);
           renderPlotControls();
           renderPlots();
         });
@@ -1757,7 +1806,6 @@ function init() {
           renderPlots();
         });
       }
-      // Export buttons are wired directly inside the makeSection closure above.
     }
 
     function getSelectedTypesInOrder() {
@@ -1877,8 +1925,8 @@ function init() {
       // Area date-range gate
       let areaRangeStart = null, areaRangeEnd = null;
       if (plotState.areaRangeEnabled && plotState.areaRangeStart && plotState.areaRangeEnd) {
-        areaRangeStart = new Date(plotState.areaRangeStart);
-        areaRangeEnd   = new Date(plotState.areaRangeEnd);
+        areaRangeStart = parseDay(plotState.areaRangeStart);
+        areaRangeEnd   = parseDay(plotState.areaRangeEnd);
         if (isNaN(areaRangeStart) || isNaN(areaRangeEnd) || areaRangeStart > areaRangeEnd) {
           areaRangeStart = null; areaRangeEnd = null;
         }
@@ -1887,8 +1935,8 @@ function init() {
       // Type/Status shared date-range gate
       let tsRangeStart = null, tsRangeEnd = null;
       if (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd) {
-        tsRangeStart = new Date(plotState.typeStatusRangeStart);
-        tsRangeEnd   = new Date(plotState.typeStatusRangeEnd);
+        tsRangeStart = parseDay(plotState.typeStatusRangeStart);
+        tsRangeEnd   = parseDay(plotState.typeStatusRangeEnd);
         if (isNaN(tsRangeStart) || isNaN(tsRangeEnd) || tsRangeStart > tsRangeEnd) {
           tsRangeStart = null; tsRangeEnd = null;
         }
@@ -1903,7 +1951,7 @@ function init() {
         if (tsRangeStart && tsRangeEnd) {
           const dayKey = getDayKey(nomination);
           if (dayKey === "Unknown") return;
-          const nomDate = new Date(dayKey);
+          const nomDate = parseDay(dayKey);
           if (nomDate < tsRangeStart || nomDate > tsRangeEnd) return;
         }
 
@@ -1911,7 +1959,7 @@ function init() {
         if (areaRangeStart && areaRangeEnd) {
           const dayKey = getDayKey(nomination);
           if (dayKey === "Unknown") return;
-          const nomDate = new Date(dayKey);
+          const nomDate = parseDay(dayKey);
           if (nomDate < areaRangeStart || nomDate > areaRangeEnd) return;
         }
 
@@ -2264,22 +2312,18 @@ function init() {
       chart.appendChild(outer);
     }
 
-    function getMonthKey(nomination) {
-      if (!nomination.day) return "Unknown";
-
-      const d = new Date(nomination.day);
-      if (isNaN(d)) return "Unknown";
-
-      const year = d.getFullYear();
-      const month = String(d.getMonth() + 1).padStart(2, "0");
-
-      return `${year}-${month}`;
+    // Date-only strings must be read as local dates; new Date("YYYY-MM-DD") is UTC and shifts days west of UTC.
+    function parseDay(str) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(str));
+      return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(str);
     }
 
-    function getDayKey(nomination) {
-      const dateStr = nomination.day || nomination.lastUpdateTime || nomination.imageImportedAt;
-      if (!dateStr) return "Unknown";
-      const d = new Date(dateStr);
+    // One date source for both month and day views so their totals agree.
+    function nominationDateKey(nomination) {
+      const raw = nomination.day || nomination.lastUpdateTime || nomination.imageImportedAt;
+      if (!raw) return "Unknown";
+      if (typeof raw === "string" && /^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+      const d = new Date(raw);
       if (isNaN(d)) return "Unknown";
       const y = d.getFullYear();
       const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -2287,11 +2331,28 @@ function init() {
       return `${y}-${m}-${day}`;
     }
 
+    function getMonthKey(nomination) {
+      const key = nominationDateKey(nomination);
+      return key === "Unknown" ? key : key.slice(0, 7);
+    }
+
+    function getDayKey(nomination) {
+      return nominationDateKey(nomination);
+    }
+
+    // State/province part of an area label; OSM labels are "town, mid, country".
+    function getProvinceLevelLabel(label) {
+      const parts = label.split(",").map(s => s.trim()).filter(Boolean);
+      if (parts.length < 2) return label;
+      if (plotState.aggregationMode === "osm") return parts.slice(parts.length >= 3 ? 1 : 0).join(", ");
+      return parts[parts.length - 1];
+    }
+
     function buildContinuousDayRange(minDay, maxDay) {
       const days = [];
       if (!minDay || !maxDay) return days;
-      const cur = new Date(minDay);
-      const end = new Date(maxDay);
+      const cur = parseDay(minDay);
+      const end = parseDay(maxDay);
       while (cur <= end) {
         const y = cur.getFullYear();
         const m = String(cur.getMonth() + 1).padStart(2, "0");
@@ -2348,8 +2409,8 @@ function init() {
 
       let rangeStart = null, rangeEnd = null, rangeInfo = null;
       if (useRange) {
-        rangeStart = new Date(plotState.timelineRangeStart);
-        rangeEnd   = new Date(plotState.timelineRangeEnd);
+        rangeStart = parseDay(plotState.timelineRangeStart);
+        rangeEnd   = parseDay(plotState.timelineRangeEnd);
         if (isNaN(rangeStart) || isNaN(rangeEnd) || rangeStart > rangeEnd) {
           // invalid range — fall back to no filter
           rangeStart = null; rangeEnd = null;
@@ -2383,9 +2444,7 @@ function init() {
         ) {
           // In province-only mode, match nominations whose label's province part equals the filter
           if (plotState.timelineAreaProvinceOnly) {
-            const parts = area.split(",").map(s => s.trim()).filter(Boolean);
-            const provinceLabel = parts.slice(parts.length >= 3 ? 1 : 0).join(", ");
-            if (provinceLabel !== plotState.timelineAreaFilter) return;
+            if (getProvinceLevelLabel(area) !== plotState.timelineAreaFilter) return;
           } else {
             if (area !== plotState.timelineAreaFilter) return;
           }
@@ -2393,12 +2452,12 @@ function init() {
 
         // Type/Status shared date-range gate
         if (plotState.typeStatusRangeEnabled && plotState.typeStatusRangeStart && plotState.typeStatusRangeEnd) {
-          const ts0 = new Date(plotState.typeStatusRangeStart);
-          const ts1 = new Date(plotState.typeStatusRangeEnd);
+          const ts0 = parseDay(plotState.typeStatusRangeStart);
+          const ts1 = parseDay(plotState.typeStatusRangeEnd);
           if (!isNaN(ts0) && !isNaN(ts1) && ts0 <= ts1) {
             const dayKey = getDayKey(nomination);
             if (dayKey === "Unknown") return;
-            const nomDate = new Date(dayKey);
+            const nomDate = parseDay(dayKey);
             if (nomDate < ts0 || nomDate > ts1) return;
           }
         }
@@ -2407,7 +2466,7 @@ function init() {
         if (rangeStart && rangeEnd) {
           const dayKey = getDayKey(nomination);
           if (dayKey === "Unknown") return;
-          const nomDate = new Date(dayKey);
+          const nomDate = parseDay(dayKey);
           if (nomDate < rangeStart || nomDate > rangeEnd) return;
         }
 
@@ -2507,7 +2566,7 @@ function init() {
       const rangeInfoEl = document.getElementById("wfns-range-info");
       if (rangeInfoEl && rangeInfo) {
         const modeLabel = rangeInfo.granularity === "day"
-          ? `Day view — tick every ${rangeInfo.tickEvery} day(s) — ${rangeInfo.totalDays} days total`
+          ? `Day view — ${rangeInfo.totalDays} days total`
           : `Month view — ${rangeInfo.totalDays} days span`;
         rangeInfoEl.textContent = modeLabel;
       } else if (rangeInfoEl) {
@@ -2569,8 +2628,6 @@ function init() {
 
       if (isDayMode) {
         // Day granularity: each tick is a day; fixed or responsive
-        const tickEvery  = rangeInfo ? rangeInfo.tickEvery : 1;
-        // xStepSize is always pixels-per-day; tickEvery only controls label density
         if (isScrollable) {
           xStepSize = 28; // 28px per day regardless of label density
           svgWidth  = margin.left + xPadLeft + (ticks.length - 1) * xStepSize
@@ -2971,16 +3028,7 @@ function init() {
       let areas;
       if (plotState.timelineAreaProvinceOnly) {
         // Extract the province/state level from each label and deduplicate
-        areas = Array.from(new Set(allLabels.map(label => {
-          const parts = label.split(",").map(s => s.trim()).filter(Boolean);
-          if (parts.length >= 2) {
-            // e.g. "Linh Trung, Thu Duc, Vietnam" → "Thu Duc, Vietnam"
-            // e.g. "Ho Chi Minh, Vietnam" → "Ho Chi Minh, Vietnam"
-            // Take everything from the second-to-last part onward
-            return parts.slice(parts.length >= 3 ? 1 : 0).join(", ");
-          }
-          return label;
-        }))).sort();
+        areas = Array.from(new Set(allLabels.map(getProvinceLevelLabel))).sort();
       } else {
         areas = Array.from(new Set(allLabels)).sort();
       }
@@ -3000,20 +3048,7 @@ function init() {
       queryLoop();
     });
 
-    function makeSeriesCumulative(series) {
-      return series.map(s => {
-        let runningTotal = 0;
-        return {
-          ...s,
-          values: s.values.map(v => {
-            runningTotal += v.count;
-            return { ...v, count: runningTotal };
-          })
-        };
-      });
-    }
-
-    // Same as makeSeriesCumulative but values use { tick, count } keys
+    // Running totals per series; values use { tick, count } keys
     function makeSeriesCumulativeTicks(series) {
       return series.map(s => {
         let runningTotal = 0;
