@@ -9,7 +9,6 @@
 // @grant       none
 // @updateURL   none
 // ==/UserScript==
-
 // Copyright 2024 tehstone, Tntnnbltn
 // This file is part of the Wayfarer Addons collection.
 // This file is made as a modification of the wayfarer-nomination-stats.user.js script to display figure-like plots in the web page to summarize nomination stats over time or by submission area.
@@ -1333,6 +1332,27 @@ function createRuntime(WFMM) {
       return Promise.resolve();
     }
 
+    function getExportBackground() {
+      const isDark = document.body.classList.contains("dark") ||
+                     document.documentElement.classList.contains("dark");
+      return isDark ? "#242424" : "#ffffff";
+    }
+
+    function getAggregationFilenamePart() {
+      const mode = plotState.aggregationMode;
+      return mode === "state" ? "state" : mode === "osm" ? "osm" : "citystate";
+    }
+
+    async function ensureHtml2Canvas() {
+      try {
+        await loadHtml2Canvas();
+        return typeof window.html2canvas === "function";
+      } catch (err) {
+        console.log("[WFNS Plots] Could not load html2canvas (blocked or offline):", err);
+        return false;
+      }
+    }
+
     function getExportCard(target, rootId, wrapSelector) {
       let card = target && target.closest ? target.closest(".wfns-chart-card") : null;
       if (!card && target && target.querySelector) card = target;
@@ -1461,6 +1481,32 @@ function createRuntime(WFMM) {
       const style = document.createElement("style"); style.id = "wfns-plots-css";
       style.textContent = "#wfns-plots-root {\n  --wfns-bg:#fff; --wfns-bg-card:#fff; --wfns-border:#e5e4e2;\n  --wfns-text:#131d2b; --wfns-text-muted:#7d8795; --wfns-axis:#596575;\n  --wfns-grid:#e9edf1; --wfns-ctrl-bg:#f7f7f7; --wfns-ctrl-bg2:#faf9f7;\n  --wfns-ctrl-border:#e86d28; --wfns-input-bg:#fff; --wfns-input-text:#131d2b;\n  --wfns-btn-bg:#f6f6f6; --wfns-btn-text:#131d2b; --wfns-svg-bg:#fff;\n  --wfns-bar-frame:#b1b9c4; --wfns-bar-blank:#edf0f4; --wfns-accent:#ed6725;\n  width:100%; min-width:0; box-sizing:border-box; margin-top:24px; padding:22px;\n  border:1px solid var(--wfns-border); border-radius:20px;\n  background:var(--wfns-bg); color:var(--wfns-text); font:inherit;\n  font-size:13px; line-height:1.45; overflow-anchor:none; container-type:inline-size;\n  isolation:isolate; text-align:left; color-scheme:light;\n}\n#wfns-plots-root *,#wfns-plots-root *::before,#wfns-plots-root *::after { box-sizing:border-box; }\n#wfns-plots-root[hidden],#wfns-plots-root [hidden] { display:none !important; }\n#wfns-plots-root[data-placement=\"tier\"] { border:0; border-top:1px solid var(--wfns-border); border-radius:0; padding:24px 0 0; }\n#wfns-plots-root[data-theme=\"dark\"] {\n  --wfns-bg:#1c1e22; --wfns-bg-card:#23262b; --wfns-border:#383c44;\n  --wfns-text:#eff1f5; --wfns-text-muted:#a1abba; --wfns-axis:#b9c4d3;\n  --wfns-grid:#383e48; --wfns-ctrl-bg:#282c33; --wfns-ctrl-bg2:#22262c;\n  --wfns-ctrl-border:#ff995f; --wfns-input-bg:#262a31; --wfns-input-text:#eff1f5;\n  --wfns-btn-bg:#2d323b; --wfns-btn-text:#eff1f5; --wfns-svg-bg:#23262b;\n  --wfns-bar-frame:#657184; --wfns-bar-blank:#343d4a; --wfns-accent:#ff995f; color-scheme:dark;\n}\n#wfns-plots-root .wfns-dashboard-header { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:18px; }\n#wfns-plots-root h2 { margin:0; font-family:inherit; font-size:18px; line-height:1.3; font-weight:600; color:var(--wfns-text); }\n#wfns-plots-root .wfns-dashboard-header p { margin:5px 0 0; color:var(--wfns-text-muted); font-size:11px; }\n#wfns-plots-root .wfns-theme-label { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--wfns-text-muted); }\n#wfns-plots-root button,#wfns-plots-root select,#wfns-plots-root input { font:inherit; }\n#wfns-plots-root button { cursor:pointer; background:var(--wfns-btn-bg); color:var(--wfns-btn-text); border:1px solid var(--wfns-border); border-radius:8px; padding:7px 10px; line-height:1.3; }\n#wfns-plots-root button:disabled { cursor:wait; opacity:.55; }\n#wfns-plots-root button:hover { border-color:var(--wfns-accent); }\n#wfns-plots-root :focus-visible { outline:2px solid var(--wfns-accent); outline-offset:3px; }\n#wfns-plots-root select,#wfns-plots-root input[type=\"date\"] { padding:7px 8px; max-width:100%; min-width:0; border:1px solid var(--wfns-border); background:var(--wfns-input-bg); color:var(--wfns-input-text); border-radius:7px; }\n#wfns-plots-root input[type=\"checkbox\"],#wfns-plots-root input[type=\"radio\"] { accent-color:var(--wfns-accent); margin:0 5px 0 0; vertical-align:middle; }\n#wfns-plots-root input[type=\"color\"] { width:30px; height:26px; border:0; padding:2px; background:transparent; }\n#wfns-plots-root label { color:var(--wfns-text); }\n#wfns-plots-root .wfns-settings-tabs { display:flex; border-bottom:1px solid var(--wfns-border); gap:4px; }\n#wfns-plots-root .wfns-settings-tabs button { flex:1; padding:12px 5px; border:0; border-bottom:2px solid transparent; border-radius:0; background:transparent; color:var(--wfns-text-muted); font-weight:500; }\n#wfns-plots-root .wfns-settings-tabs button[aria-selected=\"true\"] { border-bottom-color:var(--wfns-accent); color:var(--wfns-text); }\n#wfns-plots-root .wfns-settings-viewport { height:340px; overflow:auto; overscroll-behavior:contain; scrollbar-gutter:stable; border-bottom:1px solid var(--wfns-border); overflow-anchor:none; }\n#wfns-plots-root .wfns-settings-row { display:flex; flex-wrap:wrap; gap:14px; padding:18px 0; align-items:flex-start; }\n#wfns-plots-root .wfns-control-block { flex:1 1 145px; min-width:0; max-width:100%; padding:12px; border-radius:12px; background:var(--wfns-ctrl-bg); }\n#wfns-plots-root .wfns-control-block-label { margin-bottom:9px; font-size:10px; letter-spacing:.07em; font-weight:600; text-transform:uppercase; color:var(--wfns-text-muted); }\n#wfns-plots-root .wfns-control-block label { white-space:normal !important; line-height:1.7; }\n#wfns-plots-root .wfns-control-block:has(input[data-status]) { flex:2 1 250px; }\n#wfns-plots-root .wfns-control-block label:has(input[data-status]) { display:flex !important; align-items:center; white-space:nowrap !important; }\n#wfns-plots-root .wfns-toggle-switch { position:relative; display:inline-flex; align-items:center; }\n#wfns-plots-root .wfns-toggle-slider { display:none; }\n#wfns-plots-root .wfns-chart-picker { padding:18px 0 10px; }\n#wfns-plots-root .wfns-segments { display:flex; flex-wrap:wrap; gap:5px; }\n#wfns-plots-root .wfns-segments button { font-size:11px; padding:7px 10px; border-color:transparent; border-radius:8px; white-space:nowrap; }\n#wfns-plots-root .wfns-segments button[aria-selected=\"true\"] { color:var(--wfns-bg); background:var(--wfns-text); }\n#wfns-plots-root .wfns-group-tabs { margin-top:9px; }\n#wfns-plots-root .wfns-group-tabs button { background:transparent; color:var(--wfns-text-muted); }\n#wfns-plots-root .wfns-chart-hint { font-size:10px; color:var(--wfns-text-muted); margin:10px 0 0; min-height:15px; }\n#wfns-plots-root #wfns-chart-gallery { height:660px; max-height:82vh; min-height:400px; overflow:auto; overscroll-behavior:contain; scrollbar-gutter:stable; overflow-anchor:none; contain:layout style; padding-right:2px; }\n#wfns-plots-root .wfns-chart-group { border:1px solid var(--wfns-border); background:var(--wfns-bg-card); border-radius:14px; padding:12px; margin:0 0 12px; min-width:0; }\n#wfns-plots-root .wfns-group-head { display:flex; align-items:center; gap:8px; min-height:33px; margin-bottom:10px; }\n#wfns-plots-root .wfns-group-head h3 { margin:0 auto 0 0; font-size:13px; font-weight:600; color:var(--wfns-text); }\n#wfns-plots-root .wfns-export-pair { font-size:10px; padding:6px 8px; background:transparent; }\n#wfns-plots-root .wfns-chart-pair { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; }\n#wfns-plots-root .wfns-chart-slot { min-width:0; height:330px; overflow:hidden; border:1px solid var(--wfns-border); border-radius:10px; background:var(--wfns-bg-card); }\n#wfns-plots-root .wfns-chart-slot[data-pending]::before { content:attr(data-pending); display:block; padding:16px; color:var(--wfns-text-muted); font-size:12px; }\n#wfns-plots-root .wfns-chart-card { height:100%; min-width:0; display:flex; flex-direction:column; gap:0; padding:10px; }\n#wfns-plots-root .wfns-chart-header { display:flex; gap:6px; align-items:flex-start; min-height:32px; margin-bottom:4px; flex:none; }\n#wfns-plots-root .wfns-chart-title { font-size:10px; font-weight:500; line-height:1.4; color:var(--wfns-text-muted); overflow-wrap:anywhere; margin-right:auto; }\n#wfns-plots-root .wfns-chart-export-button { flex:none; font-size:9px; padding:3px 5px; background:transparent; }\n#wfns-plots-root .wfns-bars-wrap,#wfns-plots-root .wfns-timeline-wrap { flex:1; min-height:0; overflow:auto !important; overscroll-behavior:contain; border:0 !important; padding:0 !important; }\n#wfns-plots-root .wfns-bars-wrap svg { height:240px; }\n#wfns-plots-root .wfns-timeline-wrap svg { max-width:none; height:240px; }\n#wfns-plots-root .wfns-chart-card > div:last-child:not(.wfns-chart-header):not(.wfns-bars-wrap):not(.wfns-timeline-wrap) { flex:none; max-height:40px; overflow:auto; font-size:10px; gap:5px 9px !important; margin-top:6px !important; }\n#wfns-plots-root .wfns-legend-item { font-size:10px; }\n#wfns-plots-root .wfns-data-label { font-size:10px; text-anchor:middle; pointer-events:none; }\n#wfns-plots-root .wfns-hover-readout { height:17px; flex:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9px; color:var(--wfns-text-muted); }\n#wfns-plots-root #wfns-osm-bar { min-height:20px; margin:8px 0 0 !important; padding:0 !important; border:0 !important; font-size:10px !important; background:transparent !important; }\n#wfns-plots-root #wfns-osm-spin { display:none !important; }\n#wfns-plots-root #wfns-osm-status-slot { min-height:25px; }\n#wfns-plots-root .wfns-export-status { margin:7px 0 0; min-height:16px; font-size:10px; color:var(--wfns-text-muted); }\n@container (min-width:600px) {\n  #wfns-plots-root .wfns-chart-pair { grid-template-columns:repeat(2,minmax(0,1fr)); }\n  #wfns-plots-root .wfns-chart-slot { height:330px; }\n}\n@container (max-width:390px) {\n  #wfns-plots-root .wfns-dashboard-header { flex-wrap:wrap; }\n  #wfns-plots-root .wfns-control-block { flex-basis:130px; padding:9px; }\n  #wfns-plots-root .wfns-settings-row { gap:8px; }\n  #wfns-plots-root .wfns-segments button { padding:7px; font-size:10px; }\n  #wfns-plots-root .wfns-chart-group { padding:8px; }\n}\n@media (max-width:600px) { #wfns-plots-root { padding:14px; border-radius:16px; } }\n@media (prefers-reduced-motion:reduce) { #wfns-plots-root * { scroll-behavior:auto !important; animation:none !important; transition:none !important; } }\n\n/* 0.9.1: normal page flow throughout, with no nested scrolling containers. */\n#wfns-plots-root { overflow:visible; align-self:start; min-width:0; }\n#wfns-plots-root[data-placement=\"tier\"] { border:1px solid var(--wfns-border); border-radius:20px; padding:22px; }\n#wfns-plots-root .wfns-dashboard-header { margin-bottom:14px; }\n#wfns-plots-root .wfns-settings-viewport,\n#wfns-plots-root #wfns-chart-gallery,\n#wfns-plots-root .wfns-chart-slot,\n#wfns-plots-root .wfns-chart-card,\n#wfns-plots-root .wfns-bars-wrap,\n#wfns-plots-root .wfns-timeline-wrap,\n#wfns-plots-root .wfns-chart-card > div:last-child {\n  height:auto !important; max-height:none !important; overflow:visible !important;\n  overscroll-behavior:auto !important; contain:none; scrollbar-gutter:auto;\n}\n#wfns-plots-root #wfns-chart-gallery { min-height:0; padding:0; }\n#wfns-plots-root .wfns-settings-viewport { min-height:0; }\n#wfns-plots-root .wfns-settings-row { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; padding:16px 0; }\n#wfns-plots-root .wfns-control-block { flex:none; min-width:0; padding:12px; }\n#wfns-plots-root .wfns-control-block[data-control=\"status-colours\"] { grid-column:span 2; }\n#wfns-plots-root .wfns-colour-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:5px 14px; }\n#wfns-plots-root .wfns-colour-grid > label { display:flex; align-items:center; gap:7px; min-width:0; margin:0; }\n#wfns-plots-root .wfns-colour-grid > label > span { white-space:normal !important; }\n#wfns-plots-root .wfns-colour-grid input[type=\"color\"] { flex:none; margin:0; }\n#wfns-plots-root .wfns-area-options-stack { display:flex; flex-direction:column; gap:10px; min-width:0; }\n#wfns-plots-root [data-control=\"osm-cache\"] > div { max-width:none !important; }\n#wfns-plots-root [data-control=\"aggregate-by\"] select { width:100%; }\n#wfns-plots-root .wfns-chart-picker { padding:16px 0; }\n#wfns-plots-root #wfns-osm-status-slot { min-height:0; }\n#wfns-plots-root .wfns-chart-group { padding:14px; margin:0 0 16px; }\n#wfns-plots-root .wfns-chart-pair { display:block !important; }\n#wfns-plots-root .wfns-chart-slot { margin-top:12px; }\n#wfns-plots-root .wfns-chart-card { display:block; padding:12px; }\n#wfns-plots-root .wfns-chart-header { min-height:0; margin-bottom:12px; }\n#wfns-plots-root .wfns-chart-title { font-size:12px; color:var(--wfns-text); }\n#wfns-plots-root .wfns-bars-wrap svg,\n#wfns-plots-root .wfns-timeline-wrap svg { display:block; width:100% !important; height:auto !important; max-width:100%; }\n#wfns-plots-root .wfns-chart-card > div:last-child { display:flex; flex-wrap:wrap; margin-top:10px !important; }\n#wfns-plots-root .wfns-hover-readout { height:auto; max-height:none; overflow:visible; white-space:normal; overflow-wrap:anywhere; margin-top:7px; }\n#wfns-plots-root .wfns-export-status:empty { display:none; }\n@container (max-width:580px) {\n  #wfns-plots-root .wfns-settings-row { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }\n  #wfns-plots-root .wfns-control-block[data-control=\"statuses\"] { grid-column:span 2; }\n  #wfns-plots-root .wfns-control-block[data-control=\"types\"] { grid-column:span 2; }\n  #wfns-plots-root [data-control=\"types\"] > label { display:inline-flex !important; align-items:center; width:50%; vertical-align:top; }\n  #wfns-plots-root [data-settings-panel=\"by-area\"] .wfns-settings-row { grid-template-columns:minmax(0,1fr); }\n  #wfns-plots-root .wfns-chart-group { padding:10px; }\n  #wfns-plots-root .wfns-chart-card { padding:10px; }\n}\n@container (max-width:300px) {\n  #wfns-plots-root .wfns-settings-row { grid-template-columns:minmax(0,1fr); }\n  #wfns-plots-root .wfns-control-block[data-control=\"statuses\"],\n  #wfns-plots-root .wfns-control-block[data-control=\"status-colours\"] { grid-column:auto; }\n}\n\n/* Fixed settings footprint. Hidden date controls reserve their full space. */\n#wfns-plots-root .wfns-settings-viewport { height:var(--wfns-settings-height,500px) !important; overflow:visible !important; }\n#wfns-plots-root #wfns-plot-controls { position:relative; }\n#wfns-plots-root #wfns-plot-controls.wfns-measuring-settings [data-settings-panel] {\n  display:block !important; position:absolute !important; left:0; right:0; top:0; visibility:hidden !important; pointer-events:none;\n}\n#wfns-plots-root #wfns-ts-date-range-inputs,\n#wfns-plots-root #wfns-area-date-range-inputs,\n#wfns-plots-root #wfns-date-range-inputs { display:flex !important; min-height:155px; }\n#wfns-plots-root #wfns-ts-date-range-inputs[style*=\"display: none\"],\n#wfns-plots-root #wfns-area-date-range-inputs[style*=\"display: none\"],\n#wfns-plots-root #wfns-date-range-inputs[style*=\"display: none\"] { visibility:hidden; pointer-events:none; }\n#wfns-plots-root #wfns-range-info,#wfns-plots-root #wfns-ts-range-info,#wfns-plots-root #wfns-area-range-info { min-height:30px; }\n/* Area scrolls horizontally; the page and Timeline keep normal vertical flow. */\n#wfns-plots-root .wfns-bars-wrap { overflow-x:auto !important; overflow-y:hidden !important; overscroll-behavior:auto !important; width:100%; padding:0 0 6px !important; }\n#wfns-plots-root .wfns-bars-wrap svg { width:auto !important; max-width:none !important; height:322px !important; }\n#wfns-plots-root .wfns-chart-heading { flex:1; min-width:0; }\n#wfns-plots-root .wfns-chart-title { font-size:14px; font-weight:600; }\n#wfns-plots-root .wfns-chart-subtitle { font-size:12px; color:var(--wfns-text-muted); margin-top:5px; line-height:1.5; overflow-wrap:anywhere; }\n#wfns-plots-root .wfns-chart-legend { display:flex; flex-wrap:wrap; gap:8px 14px; margin-top:12px; }\n#wfns-plots-root .wfns-hover-readout {\n  display:block !important; font-size:13px !important; line-height:1.7; min-height:88px; white-space:normal; overflow-wrap:anywhere;\n  padding:11px 12px; margin-top:12px !important; background:var(--wfns-ctrl-bg); border-radius:8px; color:var(--wfns-text);\n}\n@container (max-width:580px) { #wfns-plots-root .wfns-hover-readout { min-height:138px; font-size:13px; } }\n\n/* A single intrinsic grid track reserves the largest complete settings panel.\n   Visibility switches, rather than display, keep every panel in the track. */\n#wfns-plots-root .wfns-settings-viewport { height:auto !important; min-height:550px; overflow:visible !important; padding-bottom:32px; }\n#wfns-plots-root #wfns-plot-controls { display:grid; grid-template-columns:minmax(0,1fr); align-items:start; position:relative; }\n#wfns-plots-root #wfns-plot-controls [data-settings-panel] { display:block !important; grid-area:1 / 1; position:relative !important; min-width:0; }\n#wfns-plots-root #wfns-plot-controls [data-settings-panel][hidden] { display:block !important; visibility:hidden !important; pointer-events:none; }\n#wfns-plots-root .wfns-chart-title-line { display:flex; align-items:baseline; flex-wrap:wrap; gap:5px 12px; }\n#wfns-plots-root .wfns-chart-date { font-size:11px; line-height:1.5; color:var(--wfns-text-muted); margin-left:auto; white-space:normal; }\n#wfns-plots-root .wfns-no-chart-data,#wfns-plots-root .wfns-group-empty { padding:18px 12px; margin:0; font-size:13px; color:var(--wfns-text-muted); }\n@container (max-width:580px) {\n  #wfns-plots-root .wfns-settings-viewport { min-height:600px; padding-bottom:36px; }\n  #wfns-plots-root .wfns-chart-date { margin-left:0; flex-basis:100%; }\n}\n@container (max-width:300px) {\n  #wfns-plots-root .wfns-control-block[data-control=\"types\"] { grid-column:auto; }\n}\n\n/* Only the long Timeline scrolls; vertical wheel movement stays on the page. */\n#wfns-plots-root .wfns-timeline-wrap[data-scrollable=\"true\"] { overflow-x:auto !important; overflow-y:hidden !important; max-width:100%; overscroll-behavior:auto; }\n#wfns-plots-root .wfns-timeline-wrap[data-scrollable=\"true\"] svg { width:auto !important; max-width:none !important; height:auto !important; }\n\n#wfns-plots-root .wfns-dashboard-header { flex-wrap:wrap; }\n#wfns-plots-root .wfns-dashboard-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px 12px; }\n#wfns-plots-root #wfns-toggle-settings { font-size:11px; }\n@container (max-width:300px) { #wfns-plots-root .wfns-dashboard-actions { flex-basis:100%; justify-content:space-between; } }\n";
       document.head.appendChild(style);
+    }
+
+    // Re-render with fresh data when the plots are already on the page.
+    function refreshPlotsData() {
+      renderPlotControls();
+      requestAnimationFrame(() => {
+        renderPlots();
+        if (plotState.aggregationMode === "osm") osmStartPrewarm(nominations);
+      });
+    }
+
+    // The new page clips overflow on a fixed-height ancestor; let the first clipped one scroll.
+    function unclipPlotsAncestors() {
+      const root = document.getElementById("wfns-plots-root");
+      if (!root) return;
+      let el = root.parentElement;
+      while (el) {
+        const cs = getComputedStyle(el);
+        const clipped = cs.overflowY === "hidden" || cs.overflowY === "clip";
+        if (clipped && el.scrollHeight > el.clientHeight + 1) {
+          el.style.setProperty("overflow-y", "auto", "important");
+          return;
+        }
+        if (cs.overflowY === "auto" || cs.overflowY === "scroll") return;
+        el = el.parentElement;
+      }
     }
 
     // Functionality to add plots section
@@ -2040,6 +2086,7 @@ function createRuntime(WFMM) {
         input.addEventListener("change", (e) => {
           plotState.aggregationMode = e.target.value;
           plotState.timelineAreaFilter = "__ALL__";
+          if (plotState.aggregationMode === "osm") osmStartPrewarm(nominations);
           renderPlotControls();
           renderPlots();
         });
@@ -3026,6 +3073,23 @@ function createRuntime(WFMM) {
       return nominationDateKey(nomination);
     }
 
+    function getMonthKey(nomination) {
+      const key = nominationDateKey(nomination);
+      return key === "Unknown" ? key : key.slice(0, 7);
+    }
+
+    function getDayKey(nomination) {
+      return nominationDateKey(nomination);
+    }
+
+    // State/province part of an area label; OSM labels are "town, mid, country".
+    function getProvinceLevelLabel(label) {
+      const parts = label.split(",").map(s => s.trim()).filter(Boolean);
+      if (parts.length < 2) return label;
+      if (plotState.aggregationMode === "osm") return parts.slice(parts.length >= 3 ? 1 : 0).join(", ");
+      return parts[parts.length - 1];
+    }
+
     function buildContinuousDayRange(minDay, maxDay) {
       const days = [];
       const start = Date.parse(minDay + "T00:00:00Z");
@@ -3236,7 +3300,7 @@ function createRuntime(WFMM) {
       const rangeInfoEl = document.getElementById("wfns-range-info");
       if (rangeInfoEl && rangeInfo) {
         const modeLabel = rangeInfo.granularity === "day"
-          ? `Day view — tick every ${rangeInfo.tickEvery} day(s) — ${rangeInfo.totalDays} days total`
+          ? `Day view — ${rangeInfo.totalDays} days total`
           : `Month view — ${rangeInfo.totalDays} days span`;
         rangeInfoEl.textContent = modeLabel;
       } else if (rangeInfoEl) {
@@ -3540,20 +3604,7 @@ function createRuntime(WFMM) {
       queryLoop();
     });
 
-    function makeSeriesCumulative(series) {
-      return series.map(s => {
-        let runningTotal = 0;
-        return {
-          ...s,
-          values: s.values.map(v => {
-            runningTotal += v.count;
-            return { ...v, count: runningTotal };
-          })
-        };
-      });
-    }
-
-    // Same as makeSeriesCumulative but values use { tick, count } keys
+    // Running totals per series; values use { tick, count } keys
     function makeSeriesCumulativeTicks(series) {
       return series.map(s => {
         let runningTotal = 0;
